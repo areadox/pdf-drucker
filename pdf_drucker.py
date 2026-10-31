@@ -42,6 +42,9 @@ except ImportError:
     win32print = None
 
 APP_NAME = "PDF-Ablage"
+APP_VERSION = "0.0.0-dev"  # wird beim Release-Build aus dem Git-Tag gesetzt (v1.2.3 -> 1.2.3)
+GITHUB_REPO = "areadox/pdf-drucker"
+EXE_ASSET = "PDF-Ablage.exe"
 APP_DIR = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "PDFDrucker"
 SPOOL_DIR = APP_DIR / "spool"
 SPOOL_FILE = SPOOL_DIR / "eingang.pdf"
@@ -61,6 +64,9 @@ DEFAULT_CONFIG = {
     "poll_interval": 0.5,
     "open_after_save": False,
     "notify": True,
+    "auto_update_check": True,
+    # Nur nötig, solange das GitHub-Repo privat ist (Fine-grained Token, nur "Contents: Read")
+    "github_token": "",
 }
 
 log = logging.getLogger("pdf_drucker")
@@ -139,7 +145,7 @@ def unique_path(folder: Path, stem: str) -> Path:
 def message(text: str, title: str = APP_NAME, error: bool = False) -> None:
     """Meldung als Fenster (in der .exe) bzw. in der Konsole."""
     if FROZEN or not sys.stdout:
-        flags = 0x10 if error else 0x40  # MB_ICONERROR / MB_ICONINFORMATION
+        flags = (0x10 if error else 0x40) | 0x40000  # ICONERROR / ICONINFORMATION, TOPMOST
         ctypes.windll.user32.MessageBoxW(None, text, title, flags)
     else:
         print(text)
@@ -386,10 +392,125 @@ def cmd_run(args) -> int:
 
 # ---------------------------------------------------------------- Tray-App
 
-def single_instance() -> bool:
-    """Verhindert, dass die Tray-App zweimal läuft."""
-    ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\PDFAblageTray")
-    return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+def single_instance(wait_seconds: float = 0) -> bool:
+    """Verhindert, dass die Tray-App zweimal läuft. Wartet optional (nach einem Update)."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    deadline = time.time() + wait_seconds
+    while True:
+        handle = kernel32.CreateMutexW(None, False, "Global\\PDFAblageTray")
+        if ctypes.get_last_error() != 183:  # ERROR_ALREADY_EXISTS
+            return True
+        kernel32.CloseHandle(handle)
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
+# ---------------------------------------------------------------- Updates
+
+def parse_version(v: str) -> tuple[int, int, int]:
+    nums = [int(n) for n in re.findall(r"\d+", v.lstrip("vV").split("-")[0])][:3]
+    return tuple(nums + [0] * (3 - len(nums)))
+
+
+def _github_open(url: str, cfg: dict, accept: str = "application/vnd.github+json"):
+    import urllib.parse
+    import urllib.request
+
+    class NoAuthOnRedirect(urllib.request.HTTPRedirectHandler):
+        """Download-Links leiten auf einen anderen Server um – dorthin kein Token schicken."""
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            new = super().redirect_request(req, fp, code, msg, headers, newurl)
+            if new is not None and (urllib.parse.urlsplit(newurl).netloc
+                                    != urllib.parse.urlsplit(req.full_url).netloc):
+                new.headers.pop("Authorization", None)
+                new.unredirected_hdrs.pop("Authorization", None)
+            return new
+
+    req = urllib.request.Request(url, headers={
+        "Accept": accept,
+        "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    })
+    if cfg.get("github_token"):
+        req.add_header("Authorization", f"Bearer {cfg['github_token'].strip()}")
+    return urllib.request.build_opener(NoAuthOnRedirect).open(req, timeout=60)
+
+
+def check_update(cfg: dict) -> dict | None:
+    """Gibt Infos zur neuen Version zurück oder None, wenn schon aktuell."""
+    import urllib.error
+    try:
+        with _github_open(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", cfg) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise RuntimeError(
+                "Keine Version auf GitHub gefunden.\n\nFalls das Repo privat ist, trage in "
+                f"{CONFIG_FILE} unter \"github_token\" einen Lese-Token ein.") from e
+        if e.code in (401, 403):
+            raise RuntimeError("GitHub hat den Zugriff abgelehnt (Token ungültig oder abgelaufen?).") from e
+        raise
+
+    tag = data.get("tag_name", "")
+    if parse_version(tag) <= parse_version(APP_VERSION):
+        return None
+    asset = next((a for a in data.get("assets", []) if a.get("name") == EXE_ASSET), None)
+    if not asset:
+        raise RuntimeError(f"Version {tag} enthält keine {EXE_ASSET}.")
+    return {"version": tag.lstrip("vV"), "url": asset["url"], "size": asset.get("size"),
+            "notes": (data.get("body") or "").strip()}
+
+
+def old_exe_path() -> Path:
+    exe = Path(sys.executable)
+    return exe.with_name(exe.stem + ".alt.exe")
+
+
+def install_update(info: dict, cfg: dict) -> None:
+    """Lädt die neue .exe, tauscht sie gegen die laufende aus und startet sie."""
+    exe = Path(sys.executable)
+    new = exe.with_name(exe.stem + ".neu.exe")
+    old = old_exe_path()
+
+    with _github_open(info["url"], cfg, accept="application/octet-stream") as r, open(new, "wb") as f:
+        shutil.copyfileobj(r, f)
+
+    data_ok = new.stat().st_size > 0 and (info.get("size") in (None, new.stat().st_size))
+    with open(new, "rb") as f:
+        data_ok = data_ok and f.read(2) == b"MZ"
+    if not data_ok:
+        new.unlink(missing_ok=True)
+        raise RuntimeError("Der Download ist unvollständig oder beschädigt.")
+
+    if old.exists():
+        old.unlink()
+    exe.rename(old)  # eine laufende .exe darf umbenannt, aber nicht überschrieben werden
+    try:
+        new.rename(exe)
+    except OSError:
+        old.rename(exe)
+        raise
+
+    env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")  # neue Instanz unabhängig starten
+    subprocess.Popen([str(exe), "tray", "--nach-update"], env=env, close_fds=True,
+                     creationflags=0x00000008 | 0x00000200)  # DETACHED_PROCESS | NEW_PROCESS_GROUP
+    log.info("Update auf %s installiert, starte neu.", info["version"])
+
+
+def cleanup_old_exe() -> None:
+    """Entfernt nach einem Update die alte .exe (sobald der alte Prozess beendet ist)."""
+    if not FROZEN:
+        return
+    old = old_exe_path()
+    for _ in range(30):
+        if not old.exists():
+            return
+        try:
+            old.unlink()
+            return
+        except OSError:
+            time.sleep(1)
 
 
 def ask_folder(initial: str) -> str | None:
@@ -420,9 +541,12 @@ def cmd_tray(args) -> int:
     import pystray
 
     setup_logging()
-    if not single_instance():
+    after_update = getattr(args, "nach_update", False)
+    if not single_instance(wait_seconds=20 if after_update else 0):
         message(f"{APP_NAME} läuft bereits (Symbol im Infobereich der Taskleiste).")
         return 0
+    log.info("%s %s gestartet", APP_NAME, APP_VERSION)
+    threading.Thread(target=cleanup_old_exe, daemon=True).start()
 
     cfg = load_config()
     stop = threading.Event()
@@ -480,11 +604,66 @@ def cmd_tray(args) -> int:
     def toggle_autostart(_icon, _item):
         set_autostart(not STARTUP_FILE.exists())
 
-    def quit_app(_icon, _item):
+    def quit_app(_icon=None, _item=None):
         stop.set()
         icon.stop()
 
+    update_lock = threading.Lock()
+
+    def update_check(silent: bool) -> None:
+        if not update_lock.acquire(blocking=False):
+            return  # läuft schon
+        try:
+            if not FROZEN:
+                if not silent:
+                    message("Updates gibt es nur für die .exe.\nIm Quellcode-Ordner: git pull")
+                return
+            try:
+                info = check_update(cfg)
+            except Exception as e:
+                log.warning("Update-Prüfung fehlgeschlagen: %s", e)
+                if not silent:
+                    message(f"Update-Prüfung fehlgeschlagen:\n{e}", error=True)
+                return
+            if not info:
+                if not silent:
+                    message(f"Du hast bereits die neueste Version ({APP_VERSION}).")
+                return
+
+            notes = info["notes"][:600] + ("…" if len(info["notes"]) > 600 else "")
+            answer = ctypes.windll.user32.MessageBoxW(
+                None,
+                f"Version {info['version']} ist verfügbar (installiert: {APP_VERSION}).\n\n"
+                + (f"{notes}\n\n" if notes else "") + "Jetzt herunterladen und installieren?",
+                f"{APP_NAME} – Update", 0x04 | 0x40 | 0x40000)  # YESNO | INFO | TOPMOST
+            if answer != 6:
+                return
+            try:
+                icon.notify("Update wird heruntergeladen …", APP_NAME)
+            except Exception:
+                pass
+            try:
+                install_update(info, cfg)
+            except PermissionError:
+                message("Die .exe liegt in einem geschützten Ordner (z. B. „Programme“) und kann "
+                        "nicht ersetzt werden.\n\nLege PDF-Ablage.exe z. B. nach\n"
+                        f"{Path(os.environ.get('LOCALAPPDATA', '~')) / APP_NAME}\n"
+                        "und starte sie von dort.", error=True)
+                return
+            except Exception as e:
+                log.exception("Update fehlgeschlagen")
+                message(f"Update fehlgeschlagen:\n{e}", error=True)
+                return
+            quit_app()  # neue Version läuft bereits an
+        finally:
+            update_lock.release()
+
+    def check_updates_menu(_icon, _item):
+        threading.Thread(target=update_check, args=(False,), daemon=True).start()
+
     menu = pystray.Menu(
+        pystray.MenuItem(f"{APP_NAME} {APP_VERSION}", None, enabled=False),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem("Zielordner öffnen", open_folder, default=True),
         pystray.MenuItem("Zielordner ändern …", change_folder),
         pystray.Menu.SEPARATOR,
@@ -499,11 +678,26 @@ def cmd_tray(args) -> int:
         pystray.MenuItem("Drucker entfernen …", lambda *_: run_elevated("uninstall")),
         pystray.MenuItem("Protokoll öffnen", lambda *_: os.startfile(LOG_FILE)),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Nach Updates suchen …", check_updates_menu),
+        pystray.MenuItem("Automatisch nach Updates suchen", toggle("auto_update_check"),
+                         checked=lambda _: bool(cfg.get("auto_update_check"))),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem("Beenden", quit_app),
     )
-    icon = pystray.Icon(APP_NAME, make_icon_image(64), APP_NAME, menu)
+    icon = pystray.Icon(APP_NAME, make_icon_image(64), f"{APP_NAME} {APP_VERSION}", menu)
+
+    def startup_tasks():
+        if after_update:
+            try:
+                icon.notify(f"Auf Version {APP_VERSION} aktualisiert.", APP_NAME)
+            except Exception:
+                pass
+        elif cfg.get("auto_update_check"):
+            time.sleep(5)  # Start nicht ausbremsen
+            update_check(silent=True)
 
     threading.Thread(target=watch, args=(cfg, stop, notify), daemon=True).start()
+    threading.Thread(target=startup_tasks, daemon=True).start()
     icon.run()
     return 0
 
@@ -521,7 +715,11 @@ def main() -> int:
 
     sub.add_parser("uninstall", help="Drucker entfernen (Admin)").set_defaults(func=cmd_uninstall)
     sub.add_parser("run", help="Überwachung ohne Tray starten").set_defaults(func=cmd_run)
-    sub.add_parser("tray", help="Tray-App starten (Standard)").set_defaults(func=cmd_tray)
+    pt = sub.add_parser("tray", help="Tray-App starten (Standard)")
+    pt.add_argument("--nach-update", action="store_true", help=argparse.SUPPRESS)
+    pt.set_defaults(func=cmd_tray)
+    sub.add_parser("version", help="Version anzeigen").set_defaults(
+        func=lambda _a: print(f"{APP_NAME} {APP_VERSION}") or 0)
 
     pa = sub.add_parser("autostart", help="Beim Anmelden automatisch starten")
     pa.add_argument("--aus", action="store_true", help="Autostart entfernen")
