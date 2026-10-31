@@ -45,7 +45,7 @@ jobs:
           grep '^APP_VERSION' pdf_drucker.py
 
       - name: Pakete installieren
-        run: python -m pip install pyinstaller pystray pillow pywin32
+        run: python -m pip install pyinstaller pystray pillow pywin32 pypdfium2
 
       - name: Symbol und Versionsinfo erzeugen
         run: |
@@ -58,7 +58,35 @@ jobs:
           --name PDF-Ablage --icon icon.ico
           --version-file version_info.txt
           --hidden-import pystray._win32
+          --collect-all pypdfium2 --collect-all pypdfium2_raw
           pdf_drucker.py
+
+      - name: Selbsttest der gebauten EXE (Darstellung + Testdruck)
+        shell: pwsh
+        run: |
+          $out = "$env:RUNNER_TEMP\testdruck.pdf"
+          $druck = ""
+          try {
+            Set-Service Spooler -StartupType Automatic -ErrorAction Stop
+            Start-Service Spooler -ErrorAction Stop
+            $drv = (Get-PrinterDriver | Where-Object { $_.Name -like '*Print*PDF*' } | Select-Object -First 1).Name
+            Add-PrinterPort -Name $out
+            Add-Printer -Name "Testdrucker" -DriverName $drv -PortName $out
+            $druck = "Testdrucker"
+          } catch {
+            Write-Warning "Kein Drucker im Build verfügbar – teste nur die Darstellung: $_"
+          }
+          $erg = "$env:RUNNER_TEMP\selftest.txt"
+          $args_ = @("selftest", "--ergebnis", $erg)
+          if ($druck) { $args_ = @("selftest", $druck, "--ergebnis", $erg) }
+          $p = Start-Process "dist\PDF-Ablage\PDF-Ablage.exe" -ArgumentList $args_ -Wait -PassThru
+          Get-Content $erg
+          if ($p.ExitCode -ne 0) { throw "Selbsttest fehlgeschlagen" }
+          if ($druck) {
+            for ($i = 0; $i -lt 30 -and -not (Test-Path $out); $i++) { Start-Sleep 1 }
+            if (-not (Test-Path $out)) { throw "Testdruck ist nicht angekommen" }
+            "Testdruck angekommen: $((Get-Item $out).Length) Bytes"
+          }
 
       - name: Inno Setup bereitstellen
         shell: pwsh

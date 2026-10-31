@@ -1,3 +1,4 @@
 pystray
 pillow
 pywin32
+pypdfium2

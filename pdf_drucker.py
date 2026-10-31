@@ -67,6 +67,9 @@ DEFAULT_CONFIG = {
     "poll_interval": 0.5,
     "open_after_save": False,
     "notify": True,
+    # Gespeicherte PDF zusätzlich ausdrucken ("" = Windows-Standarddrucker)
+    "print_after_save": False,
+    "print_printer": "",
     "auto_update_check": True,
     # Nur nötig, solange das GitHub-Repo privat ist (Fine-grained Token, nur "Contents: Read")
     "github_token": "",
@@ -400,7 +403,7 @@ def move_with_retry(src: Path, dst: Path, tries: int = 20) -> bool:
     return False
 
 
-def watch(cfg: dict, stop: threading.Event, on_saved=None) -> None:
+def watch(cfg: dict, stop: threading.Event, on_saved=None, print_queue=None) -> None:
     """Überwacht die Eingangsdatei, bis stop gesetzt wird. cfg darf sich währenddessen ändern."""
     tracker = JobNameTracker(cfg["printer_name"])
     log.info("Überwache %s -> %s", SPOOL_FILE, cfg["target_dir"])
@@ -426,6 +429,8 @@ def watch(cfg: dict, stop: threading.Event, on_saved=None) -> None:
                         os.startfile(dst)
                     if on_saved:
                         on_saved(dst)
+                    if print_queue is not None and cfg.get("print_after_save"):
+                        print_queue.put(dst)
                 else:
                     log.error("Konnte %s nicht verschieben.", SPOOL_FILE)
         except Exception:
@@ -436,11 +441,143 @@ def watch(cfg: dict, stop: threading.Event, on_saved=None) -> None:
 def cmd_run(args) -> int:
     setup_logging()
     stop = threading.Event()
+    cfg = load_config()
     try:
-        watch(load_config(), stop)
+        watch(cfg, stop, print_queue=start_print_worker(cfg))
     except KeyboardInterrupt:
         log.info("Beendet.")
     return 0
+
+
+# ---------------------------------------------------------------- Ausdrucken
+
+def list_printers(exclude: str | None = None) -> list[str]:
+    """Alle installierten Drucker (lokal und Netzwerk), optional ohne einen bestimmten."""
+    if not win32print:
+        return []
+    flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+    names = sorted({p["pPrinterName"] for p in win32print.EnumPrinters(flags, None, 4)}, key=str.lower)
+    return [n for n in names if n != exclude]
+
+
+def resolve_print_printer(cfg: dict) -> str:
+    """Zieldrucker für den Ausdruck; verhindert, dass auf den eigenen PDF-Drucker gedruckt wird."""
+    name = cfg.get("print_printer") or win32print.GetDefaultPrinter()
+    if name == cfg["printer_name"]:
+        raise RuntimeError(f"'{name}' ist der PDF-Ablage-Drucker selbst – das ergäbe eine Endlosschleife. "
+                           "Bitte im Menü unter „Ausdrucken auf“ einen echten Drucker wählen.")
+    return name
+
+
+def print_pdf(path: Path, printer: str, max_dpi: int = 300) -> int:
+    """Druckt eine PDF über pdfium und die Windows-Druckschnittstelle. Gibt die Seitenzahl zurück."""
+    import pypdfium2 as pdfium
+    import win32ui
+    from PIL import ImageWin
+
+    LOGPIXELSX, LOGPIXELSY = 88, 90
+    PHYSICALWIDTH, PHYSICALHEIGHT, PHYSICALOFFSETX, PHYSICALOFFSETY = 110, 111, 112, 113
+
+    pdf = pdfium.PdfDocument(str(path))
+    dc = win32ui.CreateDC()
+    dc.CreatePrinterDC(printer)
+    try:
+        dpi = min(dc.GetDeviceCaps(LOGPIXELSX), dc.GetDeviceCaps(LOGPIXELSY), max_dpi)
+        paper_w, paper_h = dc.GetDeviceCaps(PHYSICALWIDTH), dc.GetDeviceCaps(PHYSICALHEIGHT)
+        off_x, off_y = dc.GetDeviceCaps(PHYSICALOFFSETX), dc.GetDeviceCaps(PHYSICALOFFSETY)
+
+        dc.StartDoc(path.name)
+        pages = len(pdf)
+        for i in range(pages):
+            page = pdf[i]
+            try:
+                img = page.render(scale=dpi / 72).to_pil()
+            finally:
+                page.close()
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            # Querformat-Seite auf Hochformat-Papier (oder umgekehrt) drehen
+            if (img.width > img.height) != (paper_w > paper_h):
+                img = img.rotate(90, expand=True)
+            # Seite auf das Papier einpassen (Seitenverhältnis beibehalten, zentriert)
+            scale = min(paper_w / img.width, paper_h / img.height)
+            w, h = int(img.width * scale), int(img.height * scale)
+            x = (paper_w - w) // 2 - off_x  # Koordinaten beziehen sich auf den bedruckbaren Bereich
+            y = (paper_h - h) // 2 - off_y
+            dc.StartPage()
+            ImageWin.Dib(img).draw(dc.GetHandleOutput(), (x, y, x + w, y + h))
+            dc.EndPage()
+        dc.EndDoc()
+        return pages
+    finally:
+        dc.DeleteDC()
+        pdf.close()
+
+
+def start_print_worker(cfg: dict, on_done=None, on_error=None):
+    """Startet einen Hintergrund-Thread, der PDFs der Reihe nach druckt. Gibt die Warteschlange zurück."""
+    import queue
+    q: "queue.Queue[Path]" = queue.Queue()
+
+    def worker():
+        while True:
+            path = q.get()
+            try:
+                printer = resolve_print_printer(cfg)
+                pages = print_pdf(path, printer)
+                log.info("Gedruckt (%d Seite%s) auf '%s': %s", pages, "" if pages == 1 else "n", printer, path.name)
+                if on_done:
+                    on_done(path, printer)
+            except Exception as e:
+                log.exception("Drucken fehlgeschlagen: %s", path)
+                if on_error:
+                    on_error(path, e)
+            finally:
+                q.task_done()
+
+    threading.Thread(target=worker, daemon=True).start()
+    return q
+
+
+def make_test_pdf(path: Path) -> None:
+    """Zweiseitige Test-PDF (Hoch- und Querformat) ohne Zusatzbibliotheken erzeugen."""
+    from PIL import Image, ImageDraw
+    pages = []
+    for size, text in (((1240, 1754), "PDF-Ablage Testseite 1 (Hochformat)"),
+                       ((1754, 1240), "PDF-Ablage Testseite 2 (Querformat)")):
+        img = Image.new("RGB", size, "white")
+        d = ImageDraw.Draw(img)
+        d.rectangle([40, 40, size[0] - 40, size[1] - 40], outline="black", width=6)
+        d.text((100, 100), text, fill="black")
+        pages.append(img)
+    pages[0].save(path, save_all=True, append_images=pages[1:], resolution=150)
+
+
+def cmd_selftest(args) -> int:
+    """Prüft PDF-Darstellung und Drucken (für den Build und zur Fehlersuche)."""
+    import tempfile
+    result = Path(args.ergebnis) if args.ergebnis else None
+    lines = [f"{APP_NAME} {APP_VERSION}"]
+    try:
+        pdf = Path(tempfile.gettempdir()) / "pdf-ablage-selftest.pdf"
+        make_test_pdf(pdf)
+        import pypdfium2 as pdfium
+        doc = pdfium.PdfDocument(str(pdf))
+        lines.append(f"Darstellung ok: {len(doc)} Seiten")
+        doc.close()
+        if args.drucker:
+            pages = print_pdf(pdf, args.drucker)
+            lines.append(f"Druck ok: {pages} Seiten an '{args.drucker}'")
+        code = 0
+    except Exception as e:
+        lines.append(f"FEHLER: {type(e).__name__}: {e}")
+        code = 1
+    text = "\n".join(lines)
+    if result:
+        result.write_text(text, encoding="utf-8")
+    else:
+        message(text, error=bool(code))
+    return code
 
 
 # ---------------------------------------------------------------- Tray-App
@@ -590,6 +727,59 @@ def cmd_tray(args) -> int:
             except Exception:
                 pass
 
+    def printed(path: Path, printer: str) -> None:
+        if cfg.get("notify"):
+            try:
+                icon.notify(f"{path.name}\n→ {printer}", "Ausgedruckt")
+            except Exception:
+                pass
+
+    def print_failed(path: Path, error: Exception) -> None:
+        try:  # Fehler immer melden, auch wenn Benachrichtigungen aus sind
+            icon.notify(str(error)[:200], "Drucken fehlgeschlagen")
+        except Exception:
+            pass
+
+    print_queue = start_print_worker(cfg, printed, print_failed)
+
+    def set_print_printer(name: str):
+        def action(_icon, _item):
+            cfg["print_printer"] = name
+            try:
+                save_config(cfg)
+            except OSError:
+                pass
+        return action
+
+    def printer_menu_items():
+        current = cfg.get("print_printer", "")
+        try:
+            default = win32print.GetDefaultPrinter() if win32print else ""
+        except Exception:
+            default = ""
+        yield pystray.MenuItem(f"Windows-Standarddrucker ({default or '–'})", set_print_printer(""),
+                               checked=lambda _: not cfg.get("print_printer"), radio=True)
+        yield pystray.Menu.SEPARATOR
+        for name in list_printers(exclude=cfg["printer_name"]):
+            yield pystray.MenuItem(name, set_print_printer(name),
+                                   checked=lambda _, n=name: cfg.get("print_printer") == n, radio=True)
+        if current and current not in list_printers():
+            yield pystray.MenuItem(f"{current} (nicht gefunden)", None, enabled=False)
+
+    def toggle_print(_icon, _item):
+        turning_on = not cfg.get("print_after_save")
+        if turning_on:
+            try:
+                resolve_print_printer(cfg)
+            except Exception as e:
+                message(str(e), error=True)
+                return
+        cfg["print_after_save"] = turning_on
+        try:
+            save_config(cfg)
+        except OSError:
+            pass
+
     def open_folder(_icon=None, _item=None):
         Path(cfg["target_dir"]).mkdir(parents=True, exist_ok=True)
         os.startfile(cfg["target_dir"])
@@ -686,6 +876,9 @@ def cmd_tray(args) -> int:
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("PDF nach dem Speichern öffnen", toggle("open_after_save"),
                          checked=lambda _: bool(cfg.get("open_after_save"))),
+        pystray.MenuItem("PDF zusätzlich ausdrucken", toggle_print,
+                         checked=lambda _: bool(cfg.get("print_after_save"))),
+        pystray.MenuItem("Ausdrucken auf", pystray.Menu(printer_menu_items)),
         pystray.MenuItem("Benachrichtigung anzeigen", toggle("notify"),
                          checked=lambda _: bool(cfg.get("notify"))),
         pystray.MenuItem("Mit Windows starten", toggle_autostart,
@@ -713,7 +906,7 @@ def cmd_tray(args) -> int:
             time.sleep(5)  # Start nicht ausbremsen
             update_check(silent=True)
 
-    threading.Thread(target=watch, args=(cfg, stop, notify), daemon=True).start()
+    threading.Thread(target=watch, args=(cfg, stop, notify, print_queue), daemon=True).start()
     threading.Thread(target=startup_tasks, daemon=True).start()
     icon.run()
     return 0
@@ -737,6 +930,17 @@ def main() -> int:
     pt.set_defaults(func=cmd_tray)
     sub.add_parser("version", help="Version anzeigen").set_defaults(
         func=lambda _a: print(f"{APP_NAME} {APP_VERSION}") or 0)
+
+    ps_ = sub.add_parser("selftest", help="PDF-Darstellung und optional Drucken prüfen")
+    ps_.add_argument("drucker", nargs="?", help="Drucker für einen Testdruck (2 Seiten)")
+    ps_.add_argument("--ergebnis", help="Ergebnis in diese Datei schreiben statt anzeigen")
+    ps_.set_defaults(func=cmd_selftest)
+
+    pp = sub.add_parser("print", help="Eine PDF auf einem Drucker ausgeben")
+    pp.add_argument("datei")
+    pp.add_argument("drucker", nargs="?", help="Drucker (Standard: Einstellung bzw. Windows-Standard)")
+    pp.set_defaults(func=lambda a: print(f"{print_pdf(Path(a.datei), a.drucker or resolve_print_printer(load_config()))} "
+                                         "Seite(n) gedruckt.") or 0)
 
     pa = sub.add_parser("autostart", help="Beim Anmelden automatisch starten")
     pa.add_argument("--aus", action="store_true", help="Autostart entfernen")

@@ -22,6 +22,7 @@ Beim ersten Start fragt die App, ob der Drucker eingerichtet werden soll (Admini
 
 - Zielordner öffnen (auch per Doppelklick) / ändern
 - PDF nach dem Speichern öffnen
+- PDF zusätzlich ausdrucken, Drucker unter „Ausdrucken auf“ wählen
 - Benachrichtigung anzeigen
 - Mit Windows starten
 - Drucker einrichten / entfernen
@@ -46,6 +47,8 @@ Die App prüft beim Start (und über **„Nach Updates suchen …“** im Menü)
 | `filename_pattern` | Dateiname, Platzhalter `{datum}`, `{zeit}`, `{titel}` |
 | `open_after_save` | PDF nach dem Speichern öffnen |
 | `notify` | Benachrichtigung anzeigen |
+| `print_after_save` | gespeicherte PDF zusätzlich ausdrucken |
+| `print_printer` | Drucker dafür (leer = Windows-Standarddrucker) |
 | `auto_update_check` | beim Start nach Updates suchen |
 | `github_token` | Lese-Token, nur bei privatem Repo nötig |
 
@@ -58,9 +61,13 @@ python pdf_drucker.py uninstall       Drucker entfernen (Administrator)
 python pdf_drucker.py run             Überwachung ohne Tray
 python pdf_drucker.py autostart [--aus]
 python pdf_drucker.py config
+python pdf_drucker.py print DATEI [DRUCKER]   PDF ausdrucken
+python pdf_drucker.py selftest [DRUCKER]      Darstellung/Testdruck prüfen
 ```
 
 ## Hinweise
+
+- Der Ausdruck wird nie an den PDF-Ablage-Drucker selbst geschickt (sonst entstünde eine Endlosschleife). Ist er Windows-Standarddrucker, unter „Ausdrucken auf“ einen echten Drucker wählen.
 
 - Setup und Programm sind nicht signiert: Windows SmartScreen kann beim ersten Start warnen → „Weitere Informationen“ → „Trotzdem ausführen“. Meldet Microsoft Defender einen Fund, ist das ein Fehlalarm; er lässt sich unter [microsoft.com/wdsi/filesubmission](https://www.microsoft.com/en-us/wdsi/filesubmission) melden.
 - Werden zwei Dokumente in derselben Sekunde gedruckt, kann das zweite das erste überschreiben, bevor es abgeholt wurde.

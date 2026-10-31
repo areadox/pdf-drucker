@@ -5,7 +5,7 @@ rem Optional:      Inno Setup 6 (https://jrsoftware.org/isdl.php) für PDF-Ablag
 
 cd /d "%~dp0"
 echo === Pakete installieren ===
-python -m pip install --upgrade pyinstaller pystray pillow pywin32 || goto :fehler
+python -m pip install --upgrade pyinstaller pystray pillow pywin32 pypdfium2 || goto :fehler
 
 echo === Symbol und Versionsinfo erzeugen ===
 python pdf_drucker.py make-icon icon.ico || goto :fehler
@@ -15,6 +15,7 @@ echo === Programmordner bauen ===
 python -m PyInstaller --noconfirm --onedir --windowed ^
   --name PDF-Ablage --icon icon.ico --version-file version_info.txt ^
   --hidden-import pystray._win32 ^
+  --collect-all pypdfium2 --collect-all pypdfium2_raw ^
   pdf_drucker.py || goto :fehler
 
 set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
