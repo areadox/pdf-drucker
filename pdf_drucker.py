@@ -19,6 +19,7 @@ Befehle (optional, für die Kommandozeile):
   pdf_drucker.py autostart [--aus]  beim Anmelden starten / nicht mehr starten
   pdf_drucker.py config             Einstellungen anzeigen
   pdf_drucker.py make-icon DATEI    .ico-Datei für den Build erzeugen
+  pdf_drucker.py version            Version anzeigen
 
 Pakete für die Tray-App:  pip install pystray pillow pywin32
 """
@@ -44,14 +45,16 @@ except ImportError:
 APP_NAME = "PDF-Ablage"
 APP_VERSION = "0.0.0-dev"  # wird beim Release-Build aus dem Git-Tag gesetzt (v1.2.3 -> 1.2.3)
 GITHUB_REPO = "areadox/pdf-drucker"
-EXE_ASSET = "PDF-Ablage.exe"
+SETUP_ASSET = "PDF-Ablage-Setup.exe"
 APP_DIR = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "PDFDrucker"
 SPOOL_DIR = APP_DIR / "spool"
 SPOOL_FILE = SPOOL_DIR / "eingang.pdf"
 CONFIG_FILE = APP_DIR / "config.json"
 LOG_FILE = APP_DIR / "pdf_drucker.log"
-STARTUP_FILE = (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows"
-                / "Start Menu" / "Programs" / "Startup" / "PDF-Drucker.bat")
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"  # Autostart (gleicher Eintrag wie der Installer)
+# Autostart-Datei älterer Versionen (wird beim Start entfernt)
+OLD_STARTUP_FILE = (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows"
+                    / "Start Menu" / "Programs" / "Startup" / "PDF-Drucker.bat")
 
 FROZEN = getattr(sys, "frozen", False)  # True, wenn als .exe gebaut
 NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW: keine schwarzen Konsolenfenster
@@ -158,18 +161,42 @@ def printer_exists(name: str) -> bool:
 
 def startup_command() -> str:
     if FROZEN:
-        return f'start "" "{sys.executable}"'
+        return f'"{sys.executable}"'
     pythonw = Path(sys.executable).with_name("pythonw.exe")
     exe = pythonw if pythonw.exists() else Path(sys.executable)
-    return f'start "" "{exe}" "{Path(__file__).resolve()}"'
+    return f'"{exe}" "{Path(__file__).resolve()}"'
+
+
+def autostart_enabled() -> bool:
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            winreg.QueryValueEx(key, APP_NAME)
+        return True
+    except OSError:
+        return False
 
 
 def set_autostart(on: bool) -> None:
-    if on:
-        STARTUP_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STARTUP_FILE.write_text(f"@echo off\n{startup_command()}\n", encoding="utf-8")
-    elif STARTUP_FILE.exists():
-        STARTUP_FILE.unlink()
+    import winreg
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+        if on:
+            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, startup_command())
+        else:
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
+
+
+def migrate_old_autostart() -> None:
+    """Ältere Versionen nutzten eine .bat im Autostart-Ordner – auf Registry umstellen."""
+    if OLD_STARTUP_FILE.exists():
+        try:
+            OLD_STARTUP_FILE.unlink()
+            set_autostart(True)
+        except OSError:
+            pass
 
 
 def make_icon_image(size: int = 64):
@@ -272,7 +299,7 @@ Remove-PrinterPort -Name {ps_quote(str(SPOOL_FILE))} -ErrorAction SilentlyContin
 
 def cmd_autostart(args) -> int:
     set_autostart(not args.aus)
-    print("Autostart deaktiviert." if args.aus else f"Autostart eingerichtet: {STARTUP_FILE}")
+    print("Autostart deaktiviert." if args.aus else "Autostart eingerichtet.")
     return 0
 
 
@@ -287,6 +314,32 @@ def cmd_make_icon(args) -> int:
     img = make_icon_image(256)
     img.save(args.datei, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
     print(f"Symbol gespeichert: {args.datei}")
+    return 0
+
+
+def cmd_make_versionfile(args) -> int:
+    """Versionsinfo für die .exe (Eigenschaften -> Details), wird von PyInstaller eingebettet."""
+    v = parse_version(APP_VERSION)
+    tup = f"({v[0]}, {v[1]}, {v[2]}, 0)"
+    text = f"""VSVersionInfo(
+  ffi=FixedFileInfo(filevers={tup}, prodvers={tup}, mask=0x3f, flags=0x0, OS=0x40004,
+                    fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([StringTable('040704B0', [
+      StringStruct('CompanyName', 'areadox'),
+      StringStruct('FileDescription', 'PDF-Ablage – virtueller PDF-Drucker'),
+      StringStruct('FileVersion', '{v[0]}.{v[1]}.{v[2]}'),
+      StringStruct('InternalName', 'PDF-Ablage'),
+      StringStruct('LegalCopyright', 'areadox'),
+      StringStruct('OriginalFilename', 'PDF-Ablage.exe'),
+      StringStruct('ProductName', 'PDF-Ablage'),
+      StringStruct('ProductVersion', '{v[0]}.{v[1]}.{v[2]}')])]),
+    VarFileInfo([VarStruct('Translation', [0x0407, 1200])])
+  ]
+)
+"""
+    Path(args.datei).write_text(text, encoding="utf-8")
+    print(f"Versionsinfo gespeichert: {args.datei}")
     return 0
 
 
@@ -455,62 +508,32 @@ def check_update(cfg: dict) -> dict | None:
     tag = data.get("tag_name", "")
     if parse_version(tag) <= parse_version(APP_VERSION):
         return None
-    asset = next((a for a in data.get("assets", []) if a.get("name") == EXE_ASSET), None)
+    asset = next((a for a in data.get("assets", []) if a.get("name") == SETUP_ASSET), None)
     if not asset:
-        raise RuntimeError(f"Version {tag} enthält keine {EXE_ASSET}.")
+        raise RuntimeError(f"Version {tag} enthält kein {SETUP_ASSET}.")
     return {"version": tag.lstrip("vV"), "url": asset["url"], "size": asset.get("size"),
             "notes": (data.get("body") or "").strip()}
 
 
-def old_exe_path() -> Path:
-    exe = Path(sys.executable)
-    return exe.with_name(exe.stem + ".alt.exe")
-
-
 def install_update(info: dict, cfg: dict) -> None:
-    """Lädt die neue .exe, tauscht sie gegen die laufende aus und startet sie."""
-    exe = Path(sys.executable)
-    new = exe.with_name(exe.stem + ".neu.exe")
-    old = old_exe_path()
+    """Lädt das neue Setup und startet es still. Das Setup wartet, bis diese App beendet ist,
+    installiert die neue Version und startet sie wieder."""
+    import tempfile
+    setup = Path(tempfile.gettempdir()) / f"PDF-Ablage-Setup-{info['version']}.exe"
 
-    with _github_open(info["url"], cfg, accept="application/octet-stream") as r, open(new, "wb") as f:
+    with _github_open(info["url"], cfg, accept="application/octet-stream") as r, open(setup, "wb") as f:
         shutil.copyfileobj(r, f)
 
-    data_ok = new.stat().st_size > 0 and (info.get("size") in (None, new.stat().st_size))
-    with open(new, "rb") as f:
-        data_ok = data_ok and f.read(2) == b"MZ"
-    if not data_ok:
-        new.unlink(missing_ok=True)
+    size = setup.stat().st_size
+    with open(setup, "rb") as f:
+        ok = size > 0 and info.get("size") in (None, size) and f.read(2) == b"MZ"
+    if not ok:
+        setup.unlink(missing_ok=True)
         raise RuntimeError("Der Download ist unvollständig oder beschädigt.")
 
-    if old.exists():
-        old.unlink()
-    exe.rename(old)  # eine laufende .exe darf umbenannt, aber nicht überschrieben werden
-    try:
-        new.rename(exe)
-    except OSError:
-        old.rename(exe)
-        raise
-
-    env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")  # neue Instanz unabhängig starten
-    subprocess.Popen([str(exe), "tray", "--nach-update"], env=env, close_fds=True,
-                     creationflags=0x00000008 | 0x00000200)  # DETACHED_PROCESS | NEW_PROCESS_GROUP
-    log.info("Update auf %s installiert, starte neu.", info["version"])
-
-
-def cleanup_old_exe() -> None:
-    """Entfernt nach einem Update die alte .exe (sobald der alte Prozess beendet ist)."""
-    if not FROZEN:
-        return
-    old = old_exe_path()
-    for _ in range(30):
-        if not old.exists():
-            return
-        try:
-            old.unlink()
-            return
-        except OSError:
-            time.sleep(1)
+    subprocess.Popen([str(setup), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/UPDATE=1"],
+                     close_fds=True, creationflags=0x00000008 | 0x00000200)  # DETACHED | NEW_GROUP
+    log.info("Setup für Version %s gestartet.", info["version"])
 
 
 def ask_folder(initial: str) -> str | None:
@@ -546,7 +569,7 @@ def cmd_tray(args) -> int:
         message(f"{APP_NAME} läuft bereits (Symbol im Infobereich der Taskleiste).")
         return 0
     log.info("%s %s gestartet", APP_NAME, APP_VERSION)
-    threading.Thread(target=cleanup_old_exe, daemon=True).start()
+    migrate_old_autostart()
 
     cfg = load_config()
     stop = threading.Event()
@@ -602,7 +625,7 @@ def cmd_tray(args) -> int:
         return action
 
     def toggle_autostart(_icon, _item):
-        set_autostart(not STARTUP_FILE.exists())
+        set_autostart(not autostart_enabled())
 
     def quit_app(_icon=None, _item=None):
         stop.set()
@@ -644,17 +667,11 @@ def cmd_tray(args) -> int:
                 pass
             try:
                 install_update(info, cfg)
-            except PermissionError:
-                message("Die .exe liegt in einem geschützten Ordner (z. B. „Programme“) und kann "
-                        "nicht ersetzt werden.\n\nLege PDF-Ablage.exe z. B. nach\n"
-                        f"{Path(os.environ.get('LOCALAPPDATA', '~')) / APP_NAME}\n"
-                        "und starte sie von dort.", error=True)
-                return
             except Exception as e:
                 log.exception("Update fehlgeschlagen")
                 message(f"Update fehlgeschlagen:\n{e}", error=True)
                 return
-            quit_app()  # neue Version läuft bereits an
+            quit_app()  # Setup wartet, bis die App beendet ist, und startet die neue Version
         finally:
             update_lock.release()
 
@@ -672,7 +689,7 @@ def cmd_tray(args) -> int:
         pystray.MenuItem("Benachrichtigung anzeigen", toggle("notify"),
                          checked=lambda _: bool(cfg.get("notify"))),
         pystray.MenuItem("Mit Windows starten", toggle_autostart,
-                         checked=lambda _: STARTUP_FILE.exists()),
+                         checked=lambda _: autostart_enabled()),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Drucker einrichten …", lambda *_: run_elevated("install")),
         pystray.MenuItem("Drucker entfernen …", lambda *_: run_elevated("uninstall")),
@@ -731,8 +748,12 @@ def main() -> int:
     pm.add_argument("datei")
     pm.set_defaults(func=cmd_make_icon)
 
+    pv = sub.add_parser("make-versionfile", help="Versionsinfo für PyInstaller erzeugen (für den Build)")
+    pv.add_argument("datei")
+    pv.set_defaults(func=cmd_make_versionfile)
+
     args = p.parse_args()
-    if args.cmd == "make-icon":
+    if args.cmd in ("make-icon", "make-versionfile", "version"):
         return args.func(args)
     if os.name != "nt":
         print("Dieses Tool läuft nur unter Windows.")

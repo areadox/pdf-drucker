@@ -12,9 +12,9 @@ Läuft als kleines Symbol im Infobereich der Taskleiste.
 
 ## Installation
 
-**Fertige .exe:** unter [Releases](../../releases) die neueste `PDF-Ablage.exe` herunterladen (Entwicklungs-Builds jedes Commits liegen unter [Actions](../../actions)).
+**Installer:** unter [Releases](../../releases) die neueste `PDF-Ablage-Setup.exe` herunterladen und ausführen. Installiert wird ohne Adminrechte nach `%LOCALAPPDATA%\Programs\PDF-Ablage`, mit Startmenü-Eintrag und optionalem Autostart. Deinstallieren über *Einstellungen → Apps* (entfernt auch den Drucker).
 
-**Selbst bauen:** Python 3.10+ installieren („Add python.exe to PATH“ anhaken), dann `build.bat` doppelklicken. Ergebnis: `dist\PDF-Ablage.exe`.
+**Selbst bauen:** Python 3.10+ installieren („Add python.exe to PATH“ anhaken), optional [Inno Setup 6](https://jrsoftware.org/isdl.php), dann `build.bat` doppelklicken. Ergebnis: `dist\PDF-Ablage-Setup.exe` (ohne Inno Setup nur der Programmordner `dist\PDF-Ablage`).
 
 Beim ersten Start fragt die App, ob der Drucker eingerichtet werden soll (Administratorrechte nötig).
 
@@ -29,9 +29,8 @@ Beim ersten Start fragt die App, ob der Drucker eingerichtet werden soll (Admini
 
 ## Updates
 
-Die App prüft beim Start (und über **„Nach Updates suchen …“** im Menü), ob unter [Releases](../../releases) eine neuere Version liegt. Auf Nachfrage lädt sie die neue `PDF-Ablage.exe`, ersetzt sich selbst und startet neu.
+Die App prüft beim Start (und über **„Nach Updates suchen …“** im Menü), ob unter [Releases](../../releases) eine neuere Version liegt. Auf Nachfrage lädt sie das neue Setup, installiert es still im Hintergrund und startet neu.
 
-- Die .exe nicht unter `C:\Programme` ablegen, sondern z. B. unter `%LOCALAPPDATA%\PDF-Ablage` – sonst darf sie sich nicht ersetzen.
 - Solange das Repo **privat** ist, braucht die App einen GitHub-Token: [Fine-grained Token](https://github.com/settings/personal-access-tokens/new) nur für dieses Repo mit **Contents: Read-only** anlegen und in `config.json` bei `github_token` eintragen.
 
 **Neue Version veröffentlichen:** unter [Actions → EXE bauen](../../actions/workflows/build.yml) auf **„Run workflow“** klicken, Version eintragen (z. B. `1.1.0`) und starten. Der Build setzt die Versionsnummer und legt ein Release mit der .exe an. Alternativ einen Git-Tag `v1.1.0` pushen.
@@ -63,5 +62,5 @@ python pdf_drucker.py config
 
 ## Hinweise
 
-- Die .exe ist nicht signiert: Windows SmartScreen warnt beim ersten Start → „Weitere Informationen“ → „Trotzdem ausführen“.
+- Setup und Programm sind nicht signiert: Windows SmartScreen kann beim ersten Start warnen → „Weitere Informationen“ → „Trotzdem ausführen“. Meldet Microsoft Defender einen Fund, ist das ein Fehlalarm; er lässt sich unter [microsoft.com/wdsi/filesubmission](https://www.microsoft.com/en-us/wdsi/filesubmission) melden.
 - Werden zwei Dokumente in derselben Sekunde gedruckt, kann das zweite das erste überschreiben, bevor es abgeholt wurde.
