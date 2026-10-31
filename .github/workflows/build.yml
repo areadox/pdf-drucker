@@ -74,18 +74,18 @@ jobs:
             Add-Printer -Name "Testdrucker" -DriverName $drv -PortName $out
             $druck = "Testdrucker"
           } catch {
-            Write-Warning "Kein Drucker im Build verfügbar – teste nur die Darstellung: $_"
+            Write-Output "::warning::Kein Drucker im Build verfügbar – nur Darstellung getestet: $_"
           }
           $erg = "$env:RUNNER_TEMP\selftest.txt"
           $args_ = @("selftest", "--ergebnis", $erg)
           if ($druck) { $args_ = @("selftest", $druck, "--ergebnis", $erg) }
           $p = Start-Process "dist\PDF-Ablage\PDF-Ablage.exe" -ArgumentList $args_ -Wait -PassThru
-          Get-Content $erg
+          Get-Content $erg | ForEach-Object { Write-Output "::notice title=Selbsttest::$_" }
           if ($p.ExitCode -ne 0) { throw "Selbsttest fehlgeschlagen" }
           if ($druck) {
             for ($i = 0; $i -lt 30 -and -not (Test-Path $out); $i++) { Start-Sleep 1 }
             if (-not (Test-Path $out)) { throw "Testdruck ist nicht angekommen" }
-            "Testdruck angekommen: $((Get-Item $out).Length) Bytes"
+            Write-Output "::notice title=Selbsttest::Testdruck angekommen: $((Get-Item $out).Length) Bytes"
           }
 
       - name: Inno Setup bereitstellen
