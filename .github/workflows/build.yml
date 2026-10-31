@@ -5,6 +5,11 @@ on:
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Neue Version veröffentlichen (z. B. 1.1.0) – leer lassen für einen Test-Build"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -19,12 +24,23 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Versionsnummer aus Tag setzen
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Versionsnummer bestimmen
+        id: ver
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          sed -i "s/^APP_VERSION = .*/APP_VERSION = \"${VERSION}\"/" pdf_drucker.py
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${{ github.event.inputs.version }}"
+            VERSION="${VERSION#v}"
+          fi
+          if [[ -n "$VERSION" ]]; then
+            if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Version muss die Form 1.2.3 haben (war: $VERSION)"; exit 1
+            fi
+            sed -i "s/^APP_VERSION = .*/APP_VERSION = \"${VERSION}\"/" pdf_drucker.py
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           grep '^APP_VERSION' pdf_drucker.py
 
       - name: Pakete installieren
@@ -45,9 +61,12 @@ jobs:
           name: PDF-Ablage
           path: dist/PDF-Ablage.exe
 
-      - name: Release anlegen (nur bei Tag v*)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Release veröffentlichen
+        if: steps.ver.outputs.version != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: PDF-Ablage ${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
           files: dist/PDF-Ablage.exe
           generate_release_notes: true

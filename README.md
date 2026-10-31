@@ -34,12 +34,7 @@ Die App prüft beim Start (und über **„Nach Updates suchen …“** im Menü)
 - Die .exe nicht unter `C:\Programme` ablegen, sondern z. B. unter `%LOCALAPPDATA%\PDF-Ablage` – sonst darf sie sich nicht ersetzen.
 - Solange das Repo **privat** ist, braucht die App einen GitHub-Token: [Fine-grained Token](https://github.com/settings/personal-access-tokens/new) nur für dieses Repo mit **Contents: Read-only** anlegen und in `config.json` bei `github_token` eintragen.
 
-**Neue Version veröffentlichen:** Git-Tag `vX.Y.Z` pushen. Der Build setzt die Versionsnummer aus dem Tag und legt ein Release mit der .exe an.
-
-```
-git tag v1.1.0
-git push origin v1.1.0
-```
+**Neue Version veröffentlichen:** unter [Actions → EXE bauen](../../actions/workflows/build.yml) auf **„Run workflow“** klicken, Version eintragen (z. B. `1.1.0`) und starten. Der Build setzt die Versionsnummer und legt ein Release mit der .exe an. Alternativ einen Git-Tag `v1.1.0` pushen.
 
 ## Einstellungen
 
