@@ -410,6 +410,25 @@ fn create_window() -> Result<HWND> {
     }
 }
 
+/// "Mit Windows starten" ist Standard: einmalig einschalten (auch nach einem Update).
+/// Schaltet man es danach im Menü aus, bleibt es aus.
+fn apply_autostart_default(cfg: &Arc<Mutex<Config>>) {
+    let Ok(mut c) = cfg.lock() else { return };
+    if c.autostart_default_applied {
+        return;
+    }
+    match install::set_autostart(true) {
+        Ok(()) => {
+            log_info!("Autostart eingeschaltet (Standard).");
+            c.autostart_default_applied = true;
+            if let Err(e) = config::save(&c) {
+                log_warn!("Einstellungen nicht gespeichert: {e:#}");
+            }
+        }
+        Err(e) => log_warn!("Autostart konnte nicht eingeschaltet werden: {e:#}"),
+    }
+}
+
 fn check_printer_setup(c: &Config) {
     if !spooler::printer_exists(&c.printer_name) {
         let text = format!(
@@ -420,10 +439,11 @@ fn check_printer_setup(c: &Config) {
         if ui::ask(&text, APP_NAME) {
             ui::run_elevated("install");
         }
-    } else if !spooler::keeps_printed_jobs(&c.printer_name) {
+    } else if !spooler::port_name(&c.printer_name).is_some_and(|p| p.eq_ignore_ascii_case(config::PIPE_NAME)) {
         let text = format!(
-            "Damit die PDF-Dateien den Namen des gedruckten Dokuments bekommen, muss der Drucker '{}' \
-             einmalig aktualisiert werden (Administratorrechte nötig).\n\nJetzt aktualisieren?",
+            "Der Drucker '{}' muss einmalig aktualisiert werden (Administratorrechte nötig).\n\n\
+             Danach bekommen die PDFs zuverlässig den Namen des Dokuments, und mehrere schnell \
+             hintereinander gedruckte Dokumente gehen nicht mehr verloren.\n\nJetzt aktualisieren?",
             c.printer_name
         );
         if ui::ask(&text, APP_NAME) {
@@ -442,6 +462,7 @@ pub fn run(after_update: bool) -> Result<i32> {
     install::migrate_old_autostart();
 
     let cfg = Arc::new(Mutex::new(config::load()));
+    apply_autostart_default(&cfg);
     let _ = STATE.set(State {
         cfg: cfg.clone(),
         icon: load_icon() as usize,

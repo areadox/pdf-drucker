@@ -1,22 +1,20 @@
 //! Zugriff auf die Windows-Druckwarteschlange (Druckerliste, Druckaufträge, Dokumentnamen).
 //!
-//! Der PDF-Ablage-Drucker ist auf "Gedruckte Dokumente beibehalten" gestellt. Dadurch bleibt
-//! der Druckauftrag nach dem Schreiben der PDF in der Warteschlange, und wir können seinen
-//! Dokumentnamen zuverlässig auslesen. Danach wird der Auftrag gelöscht.
+//! Der PDF-Ablage-Drucker schreibt in eine Named Pipe. Sobald Windows einen Auftrag an die Pipe
+//! übergibt, ist genau dieser Auftrag "wird gedruckt" – so passt der Dokumentname immer zur Datei.
 
 use crate::util::{from_wide_ptr, wide};
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::time::Duration;
 use windows_sys::Win32::Graphics::Printing::{
-    ClosePrinter, EnumJobsW, EnumPrintersW, GetDefaultPrinterW, GetPrinterW, OpenPrinterW, SetJobW,
+    ClosePrinter, EnumJobsW, EnumPrintersW, GetDefaultPrinterW, GetPrinterW, OpenPrinterW,
     JOB_INFO_1W, PRINTER_INFO_2W, PRINTER_INFO_4W,
 };
 
+const JOB_STATUS_PRINTING: u32 = 0x0000_0010;
 const JOB_STATUS_PRINTED: u32 = 0x0000_0080;
 const JOB_STATUS_COMPLETE: u32 = 0x0000_1000;
-const JOB_CONTROL_DELETE: u32 = 5;
-const PRINTER_ATTRIBUTE_KEEPPRINTEDJOBS: u32 = 0x0000_0100;
 const PRINTER_ENUM_LOCAL: u32 = 0x0000_0002;
 const PRINTER_ENUM_CONNECTIONS: u32 = 0x0000_0004;
 
@@ -83,20 +81,15 @@ impl Printer {
             .collect()
     }
 
-    pub fn delete_job(&self, id: u32) -> bool {
-        unsafe { SetJobW(self.0, id, 0, null(), JOB_CONTROL_DELETE) != 0 }
-    }
-
-    pub fn keeps_printed_jobs(&self) -> bool {
+    /// Anschluss (Port) des Druckers.
+    pub fn port_name(&self) -> Option<String> {
         let h = self.0;
-        let Some((buf, _)) = two_pass(|p, cb, need, _| unsafe { GetPrinterW(h, 2, p, cb, need) }) else {
-            return false;
-        };
+        let (buf, _) = two_pass(|p, cb, need, _| unsafe { GetPrinterW(h, 2, p, cb, need) })?;
         if buf.is_empty() {
-            return false;
+            return None;
         }
         let info = unsafe { &*(buf.as_ptr() as *const PRINTER_INFO_2W) };
-        info.Attributes & PRINTER_ATTRIBUTE_KEEPPRINTEDJOBS != 0
+        Some(unsafe { from_wide_ptr(info.pPortName) })
     }
 }
 
@@ -112,8 +105,8 @@ pub fn printer_exists(name: &str) -> bool {
     Printer::open(name).is_some()
 }
 
-pub fn keeps_printed_jobs(name: &str) -> bool {
-    Printer::open(name).map(|p| p.keeps_printed_jobs()).unwrap_or(false)
+pub fn port_name(name: &str) -> Option<String> {
+    Printer::open(name)?.port_name()
 }
 
 /// Alle installierten Drucker (lokal und Netzwerk), alphabetisch, optional ohne einen bestimmten.
@@ -148,31 +141,21 @@ pub fn default_printer() -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..end]))
 }
 
-/// Dokumentname des zuletzt fertig gedruckten Auftrags; räumt erledigte Aufträge auf.
-pub fn take_document_name(printer: &str) -> Option<String> {
+/// Dokumentname des Auftrags, den Windows gerade an den Anschluss übergibt.
+pub fn current_document_name(printer: &str) -> Option<String> {
     let p = Printer::open(printer)?;
-    let mut chosen: Option<Job> = None;
     for attempt in 0..10 {
         let jobs = p.jobs();
-        if let Some(j) = jobs.iter().filter(|j| j.finished()).max_by_key(|j| j.id) {
-            chosen = Some(j.clone());
-            break;
+        if let Some(j) = jobs.iter().filter(|j| j.status & JOB_STATUS_PRINTING != 0).min_by_key(|j| j.id) {
+            return Some(j.document.clone());
         }
-        // Ohne "Gedruckte Dokumente beibehalten" ist die Warteschlange meist schon leer
-        if jobs.is_empty() && attempt >= 2 {
-            break;
+        // Status noch nicht aktualisiert: ältester offener Auftrag ist der, der gerade läuft
+        if attempt >= 3 {
+            if let Some(j) = jobs.iter().filter(|j| !j.finished()).min_by_key(|j| j.id) {
+                return Some(j.document.clone());
+            }
         }
-        if attempt == 9 {
-            chosen = jobs.iter().max_by_key(|j| j.id).cloned();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(100));
     }
-    let job = chosen?;
-    for j in p.jobs() {
-        if j.finished() && j.id <= job.id {
-            p.delete_job(j.id);
-        }
-    }
-    Some(job.document)
+    None
 }

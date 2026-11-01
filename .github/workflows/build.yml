@@ -95,8 +95,8 @@ jobs:
           $ziel = "$tmp\ziel"
           Run-App @('install', '--ordner', $ziel)
           $pr = Get-Printer -Name 'PDF-Ablage'
-          "KeepPrintedJobs: $($pr.KeepPrintedJobs)"
-          if (-not $pr.KeepPrintedJobs) { throw 'KeepPrintedJobs ist nicht gesetzt' }
+          "Anschluss: $($pr.PortName)"
+          if ($pr.PortName -ne '\\.\pipe\PDFAblage') { throw 'Drucker nutzt nicht die Pipe' }
 
           $cfgFile = "$env:ProgramData\PDFDrucker\config.json"
           $cfg = Get-Content $cfgFile -Raw | ConvertFrom-Json
@@ -104,30 +104,58 @@ jobs:
           $cfg.print_printer = 'Testdrucker'
           $cfg | ConvertTo-Json | Set-Content $cfgFile -Encoding utf8
 
-          "== Überwachung starten und Testdokument drucken =="
-          Run-App @('make-test-pdf', "$tmp\Testdokument.pdf")
+          function Wait-Files([int]$count, [int]$seconds) {
+            for ($i = 0; $i -lt $seconds; $i++) {
+              $f = @(Get-ChildItem $ziel -Filter '*.pdf' -ErrorAction SilentlyContinue)
+              if ($f.Count -ge $count) { break }
+              Start-Sleep 1
+            }
+            @(Get-ChildItem $ziel -Filter '*.pdf' -ErrorAction SilentlyContinue)
+          }
+
+          "== 5 Dokumente gleichzeitig drucken =="
+          $namen = 1..5 | ForEach-Object { "Schnelltest$_" }
+          foreach ($n in $namen) { Run-App @('make-test-pdf', "$tmp\$n.pdf") }
           $w = Start-Process $exe -ArgumentList 'run' -PassThru -NoNewWindow
           Start-Sleep 2
-          Run-App @('print', "$tmp\Testdokument.pdf", 'PDF-Ablage')
-
-          $found = $null
-          for ($i = 0; $i -lt 40 -and -not $found; $i++) {
-            Start-Sleep 1
-            $found = Get-ChildItem $ziel -Filter '*.pdf' -ErrorAction SilentlyContinue | Select-Object -First 1
+          $jobs = foreach ($n in $namen) {
+            Start-Process $exe -ArgumentList @('print', "$tmp\$n.pdf", 'PDF-Ablage') -PassThru -NoNewWindow `
+              -RedirectStandardOutput "$tmp\$n.out" -RedirectStandardError "$tmp\$n.err"
           }
+          $jobs | Wait-Process -Timeout 60
+          $files = Wait-Files 5 60
           for ($i = 0; $i -lt 40 -and -not (Test-Path $druckOut); $i++) { Start-Sleep 1 }
-          Start-Sleep 1
-          Stop-Process $w -Force -ErrorAction SilentlyContinue
-          "== Protokoll =="
-          Get-Content $log -ErrorAction SilentlyContinue | ForEach-Object { "  | $_" }
-          "== Restliche Aufträge in der Warteschlange =="
-          Get-PrintJob -PrinterName 'PDF-Ablage' | Format-Table Id, DocumentName, JobStatus
-
-          if (-not $found) { throw 'Keine PDF im Zielordner angekommen' }
-          Write-Output "::notice title=Dateiname::$($found.Name)"
-          if ($found.Name -notlike '*Testdokument*') { throw "Dokumentname fehlt im Dateinamen: $($found.Name)" }
+          Start-Sleep 2
+          "Im Zielordner:"; $files | ForEach-Object { "  $($_.Name)  ($($_.Length) Bytes)" }
+          foreach ($n in $namen) {
+            $hits = @($files | Where-Object { $_.Name -like "*_$n.pdf" -or $_.Name -like "*_${n}_*.pdf" })
+            if ($hits.Count -ne 1) { throw "$n kam $($hits.Count)-mal an (erwartet: 1)" }
+            $kopf = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($hits[0].FullName)[0..3])
+            if ($kopf -ne '%PDF') { throw "$($hits[0].Name) ist keine gültige PDF" }
+          }
+          if ($files.Count -ne 5) { throw "Erwartet 5 PDFs, gefunden $($files.Count)" }
+          Write-Output "::notice title=Schnelldruck::5 von 5 Dokumenten mit richtigem Namen angekommen"
           if (-not (Test-Path $druckOut)) { throw 'Automatischer Ausdruck ist nicht angekommen' }
           Write-Output "::notice title=Ausdruck::$((Get-Item $druckOut).Length) Bytes an 'Testdrucker'"
+
+          "== Drucken, während die App nicht läuft =="
+          Stop-Process $w -Force -ErrorAction SilentlyContinue
+          Start-Sleep 1
+          Run-App @('make-test-pdf', "$tmp\Offlinetest.pdf")
+          Run-App @('print', "$tmp\Offlinetest.pdf", 'PDF-Ablage')
+          Start-Sleep 5
+          "Warteschlange ohne App:"; Get-PrintJob -PrinterName 'PDF-Ablage' | Format-Table Id, DocumentName, JobStatus
+          $w = Start-Process $exe -ArgumentList 'run' -PassThru -NoNewWindow
+          $files = Wait-Files 6 90
+          if (@($files | Where-Object Name -like '*Offlinetest*').Count -eq 1) {
+            Write-Output "::notice title=Ohne laufende App::Auftrag wartete in der Warteschlange und kam nach dem Start an"
+          } else {
+            Write-Output "::warning title=Ohne laufende App::Auftrag kam nach dem Start nicht innerhalb von 90 s an"
+          }
+          Stop-Process $w -Force -ErrorAction SilentlyContinue
+          "Warteschlange danach:"; Get-PrintJob -PrinterName 'PDF-Ablage' | Format-Table Id, DocumentName, JobStatus
+          "== Protokoll =="
+          Get-Content $log -ErrorAction SilentlyContinue | ForEach-Object { "  | $_" }
 
           "== Tray-App starten (darf nicht abstürzen) =="
           $t = Start-Process $exe -PassThru

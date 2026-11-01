@@ -37,7 +37,7 @@ pub fn install_printer(name: &str, target_dir: &str) -> Result<String> {
     let mut cfg = config::load();
     cfg.printer_name = name.to_string();
     cfg.target_dir = target_dir.to_string();
-    std::fs::create_dir_all(config::spool_dir())?;
+    std::fs::create_dir_all(config::app_dir())?;
     std::fs::create_dir_all(target_dir)?;
     config::save(&cfg)?;
 
@@ -49,7 +49,8 @@ pub fn install_printer(name: &str, target_dir: &str) -> Result<String> {
         .creation_flags(CREATE_NO_WINDOW)
         .output();
 
-    let port = ps_quote(&config::spool_file().to_string_lossy());
+    let port = ps_quote(config::PIPE_NAME);
+    let old_port = ps_quote(&config::old_spool_file().to_string_lossy());
     let n = ps_quote(name);
     let script = format!(
         r#"
@@ -67,8 +68,10 @@ if (Get-Printer -Name {n} -ErrorAction SilentlyContinue) {{
 }} else {{
     Add-Printer -Name {n} -DriverName $drv -PortName {port}
 }}
-# Erledigte Aufträge behalten, damit PDF-Ablage den Dokumentnamen auslesen kann
-Set-Printer -Name {n} -KeepPrintedJobs $true
+# Erledigte Aufträge nicht aufbewahren (frühere Versionen brauchten das für den Dokumentnamen)
+Set-Printer -Name {n} -KeepPrintedJobs $false
+# Alten Datei-Anschluss früherer Versionen entfernen
+Remove-PrinterPort -Name {old_port} -ErrorAction SilentlyContinue
 "#
     );
     let (ok, text) = powershell(&script)?;
@@ -104,9 +107,11 @@ pub fn cmd_uninstall() -> Result<i32> {
     let script = format!(
         "Remove-Printer -Name {} -ErrorAction SilentlyContinue\n\
          Restart-Service Spooler -ErrorAction SilentlyContinue\n\
+         Remove-PrinterPort -Name {} -ErrorAction SilentlyContinue\n\
          Remove-PrinterPort -Name {} -ErrorAction SilentlyContinue",
         ps_quote(&cfg.printer_name),
-        ps_quote(&config::spool_file().to_string_lossy())
+        ps_quote(config::PIPE_NAME),
+        ps_quote(&config::old_spool_file().to_string_lossy())
     );
     let (ok, text) = powershell(&script)?;
     let _ = set_autostart(false);

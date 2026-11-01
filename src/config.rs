@@ -18,11 +18,11 @@ pub fn app_dir() -> PathBuf {
     let base = std::env::var_os("PROGRAMDATA").unwrap_or_else(|| r"C:\ProgramData".into());
     PathBuf::from(base).join("PDFDrucker")
 }
-pub fn spool_dir() -> PathBuf {
-    app_dir().join("spool")
-}
-pub fn spool_file() -> PathBuf {
-    spool_dir().join("eingang.pdf")
+/// Anschluss des Druckers: Windows schreibt jeden Druckauftrag einzeln in diese Pipe.
+pub const PIPE_NAME: &str = r"\\.\pipe\PDFAblage";
+/// Anschluss älterer Versionen (feste Datei), wird bei der Einrichtung entfernt.
+pub fn old_spool_file() -> PathBuf {
+    app_dir().join("spool").join("eingang.pdf")
 }
 pub fn config_file() -> PathBuf {
     app_dir().join("config.json")
@@ -45,6 +45,8 @@ pub struct Config {
     pub print_after_save: bool,
     pub print_printer: String,
     pub auto_update_check: bool,
+    /// Autostart wurde einmalig als Standard eingeschaltet (danach gilt die Menü-Einstellung)
+    pub autostart_default_applied: bool,
     /// Nur nötig, solange das GitHub-Repo privat ist (Fine-grained Token, nur "Contents: Read")
     pub github_token: String,
 }
@@ -62,6 +64,7 @@ impl Default for Config {
             print_after_save: false,
             print_printer: String::new(),
             auto_update_check: true,
+            autostart_default_applied: false,
             github_token: String::new(),
         }
     }

@@ -1,15 +1,28 @@
-//! Überwacht die Eingangsdatei des Druckers und legt fertige PDFs im Zielordner ab.
+//! Empfängt die Druckaufträge über die Named Pipe und legt sie als PDF im Zielordner ab.
+//!
+//! Windows übergibt jeden Druckauftrag einzeln an die Pipe (eine Verbindung pro Auftrag).
+//! Dadurch kann nichts überschrieben werden, auch wenn mehrere Dokumente direkt
+//! hintereinander gedruckt werden.
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, PIPE_NAME};
+use crate::util::wide;
 use crate::{logic, pdf, spooler, ui};
 use anyhow::{bail, Context, Result};
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_BROKEN_PIPE, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::Storage::FileSystem::{ReadFile, PIPE_ACCESS_INBOUND};
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+};
 
 pub enum Event {
     Saved(PathBuf),
@@ -19,29 +32,111 @@ pub enum Event {
 
 pub type Events = Arc<dyn Fn(Event) + Send + Sync>;
 
+/// Nimmt Druckaufträge entgegen, bis `stop` gesetzt wird (bzw. das Programm endet).
 pub fn watch(cfg: Arc<Mutex<Config>>, stop: Arc<AtomicBool>, events: Events, print_tx: Option<Sender<PathBuf>>) {
     log_info!(
-        "Überwache {} -> {}",
-        config::spool_file().display(),
+        "Empfange Druckaufträge über {PIPE_NAME} -> {}",
         cfg.lock().map(|c| c.target_dir.clone()).unwrap_or_default()
     );
+    // Aufträge werden in einem eigenen Thread der Reihe nach abgelegt
+    let (job_tx, job_rx) = mpsc::channel::<(Vec<u8>, Option<String>)>();
+    {
+        let cfg = cfg.clone();
+        thread::spawn(move || {
+            for (data, doc) in job_rx {
+                let c = cfg.lock().map(|c| c.clone()).unwrap_or_default();
+                if let Err(e) = save_job(&c, &data, doc.as_deref(), &events, print_tx.as_ref()) {
+                    log_error!("Druckauftrag konnte nicht gespeichert werden: {e:#}");
+                }
+            }
+        });
+    }
+
+    let name = wide(PIPE_NAME);
+    let mut failures = 0u32;
     while !stop.load(Ordering::Relaxed) {
-        let c = cfg.lock().map(|c| c.clone()).unwrap_or_default();
-        if let Err(e) = process_once(&c, &events, print_tx.as_ref()) {
-            log_error!("Fehler in der Überwachung: {e:#}");
+        // Neue Pipe-Instanz anlegen, auf den nächsten Auftrag warten
+        let h = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_INBOUND,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                0,
+                1 << 20,
+                0,
+                null(),
+            )
+        };
+        if h == INVALID_HANDLE_VALUE {
+            failures += 1;
+            if failures == 1 || failures % 30 == 0 {
+                log_error!("Pipe {PIPE_NAME} konnte nicht angelegt werden (Fehler {}).", unsafe { GetLastError() });
+            }
+            thread::sleep(Duration::from_secs(2));
+            continue;
         }
-        thread::sleep(Duration::from_secs_f64(c.poll_interval.clamp(0.1, 10.0)));
+        failures = 0;
+        let connected = unsafe { ConnectNamedPipe(h, null_mut()) } != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
+        if !connected {
+            unsafe { CloseHandle(h) };
+            continue;
+        }
+        // Genau jetzt läuft der Auftrag, der in die Pipe schreibt -> Dokumentname passt sicher
+        let printer = cfg.lock().map(|c| c.printer_name.clone()).unwrap_or_default();
+        let doc = spooler::current_document_name(&printer);
+        // Lesen in eigenem Thread, damit sofort die nächste Pipe-Instanz bereitsteht
+        let (h, job_tx) = (h as usize, job_tx.clone());
+        thread::spawn(move || {
+            let data = read_all(h as _);
+            unsafe {
+                DisconnectNamedPipe(h as _);
+                CloseHandle(h as _);
+            }
+            match data {
+                Ok(data) => {
+                    let _ = job_tx.send((data, doc));
+                }
+                Err(e) => log_error!("Druckauftrag konnte nicht gelesen werden: {e:#}"),
+            }
+        });
     }
 }
 
-fn process_once(c: &Config, events: &Events, print_tx: Option<&Sender<PathBuf>>) -> Result<()> {
-    let spool = config::spool_file();
-    if !spool.exists() || !pdf_is_complete(&spool) {
+fn read_all(h: windows_sys::Win32::Foundation::HANDLE) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let mut read = 0u32;
+        let ok = unsafe { ReadFile(h, buf.as_mut_ptr(), buf.len() as u32, &mut read, null_mut()) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_BROKEN_PIPE {
+                break; // Windows hat den Auftrag fertig übertragen
+            }
+            bail!("Lesefehler {err}");
+        }
+        data.extend_from_slice(&buf[..read as usize]);
+    }
+    Ok(data)
+}
+
+fn save_job(
+    c: &Config,
+    data: &[u8],
+    doc: Option<&str>,
+    events: &Events,
+    print_tx: Option<&Sender<PathBuf>>,
+) -> Result<()> {
+    if data.is_empty() {
+        log_warn!("Leerer Druckauftrag ignoriert ({}).", doc.unwrap_or("ohne Namen"));
         return Ok(());
     }
-
-    let titel = spooler::take_document_name(&c.printer_name)
-        .map(|d| logic::clean_document_name(&d))
+    if !data.starts_with(b"%PDF") {
+        log_warn!("Druckauftrag sieht nicht wie eine PDF aus – wird trotzdem gespeichert.");
+    }
+    let titel = doc
+        .map(logic::clean_document_name)
         .filter(|d| !d.is_empty())
         .unwrap_or_else(|| "Druck".into());
 
@@ -55,7 +150,10 @@ fn process_once(c: &Config, events: &Events, print_tx: Option<&Sender<PathBuf>>)
         &titel,
     );
     let dst = logic::unique_path(&target, &logic::safe_name(&stem, 150));
-    move_with_retry(&spool, &dst)?;
+    // Erst unter Zwischennamen schreiben, damit z. B. Nextcloud keine halbe Datei synchronisiert
+    let part = dst.with_extension("pdf.part");
+    std::fs::write(&part, data).with_context(|| format!("{} nicht schreibbar", part.display()))?;
+    std::fs::rename(&part, &dst)?;
     log_info!("Gespeichert: {}", dst.display());
 
     if c.open_after_save {
@@ -68,50 +166,6 @@ fn process_once(c: &Config, events: &Events, print_tx: Option<&Sender<PathBuf>>)
         }
     }
     Ok(())
-}
-
-/// Fertig geschrieben = Größe ändert sich nicht mehr und das PDF-Ende-Kennzeichen ist da.
-fn pdf_is_complete(path: &Path) -> bool {
-    let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-    let s1 = size(path);
-    if s1 == 0 {
-        return false;
-    }
-    thread::sleep(Duration::from_millis(300));
-    if size(path) != s1 {
-        return false;
-    }
-    let Ok(mut f) = std::fs::File::open(path) else { return false };
-    let start = s1.saturating_sub(1024);
-    if f.seek(SeekFrom::Start(start)).is_err() {
-        return false;
-    }
-    let mut tail = Vec::new();
-    if f.read_to_end(&mut tail).is_err() {
-        return false;
-    }
-    tail.windows(5).any(|w| w == b"%%EOF")
-}
-
-fn move_with_retry(src: &Path, dst: &Path) -> Result<()> {
-    const ERROR_NOT_SAME_DEVICE: i32 = 17;
-    let mut last = None;
-    for _ in 0..20 {
-        match std::fs::rename(src, dst) {
-            Ok(()) => return Ok(()),
-            Err(e) if e.raw_os_error() == Some(ERROR_NOT_SAME_DEVICE) => {
-                // Zielordner auf einem anderen Laufwerk: kopieren und Original löschen
-                std::fs::copy(src, dst)?;
-                std::fs::remove_file(src)?;
-                return Ok(());
-            }
-            Err(e) => {
-                last = Some(e);
-                thread::sleep(Duration::from_millis(250)); // Spooler hält die Datei noch
-            }
-        }
-    }
-    bail!("Konnte {} nicht verschieben: {:?}", src.display(), last)
 }
 
 /// Zieldrucker für den zusätzlichen Ausdruck; nie der eigene PDF-Drucker (Endlosschleife).
