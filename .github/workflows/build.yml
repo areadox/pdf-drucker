@@ -63,18 +63,6 @@ jobs:
           Copy-Item pdfium\LICENSE dist\PDF-Ablage\pdfium-LICENSE.txt -ErrorAction SilentlyContinue
           Get-ChildItem dist\PDF-Ablage | Format-Table Name, Length
 
-      - name: Diagnose Pipe-Anschluss
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          try { Add-PrinterPort -Name '\\.\pipe\PDFAblage'; "Add-PrinterPort ok" } catch { "Add-PrinterPort FEHLER: $_" }
-          Get-PrinterPort | Where-Object Name -like '*pipe*' | Format-Table Name, Description, PortMonitor
-          $drv = (Get-PrinterDriver | Where-Object { $_.Name -like '*Print*PDF*' } | Select-Object -First 1).Name
-          try { Add-Printer -Name 'PipeTest' -DriverName $drv -PortName '\\.\pipe\PDFAblage'; "Add-Printer ok" } catch { "Add-Printer FEHLER: $_" }
-          Get-Printer -Name 'PipeTest' -ErrorAction SilentlyContinue | Format-Table Name, PortName
-          Remove-Printer -Name 'PipeTest' -ErrorAction SilentlyContinue
-          Remove-PrinterPort -Name '\\.\pipe\PDFAblage' -ErrorAction SilentlyContinue
-
       - name: End-to-End-Test (Drucker einrichten, Dokumentname, Ausdruck, Entfernen)
         shell: pwsh
         env:

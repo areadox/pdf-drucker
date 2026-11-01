@@ -20,7 +20,7 @@ fn ps_quote(s: &str) -> String {
 fn powershell(script: &str) -> Result<(bool, String)> {
     let full = format!(
         "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n$ErrorActionPreference = 'Stop'\n\
-         try {{\n{script}\n}} catch {{ Write-Output ($_ | Out-String); exit 1 }}"
+         try {{\n{script}\nexit 0\n}} catch {{ Write-Output ($_ | Out-String); exit 1 }}"
     );
     let out = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &full])
