@@ -464,7 +464,9 @@ pub fn run(after_update: bool) -> Result<i32> {
                     post_notice("Ausgedruckt", &format!("{}\n→ {printer}", name(&p)), false)
                 }
                 // Fehler immer melden, auch wenn Benachrichtigungen aus sind
-                Event::PrintFailed(_, err) => post_notice("Drucken fehlgeschlagen", &err, true),
+                Event::PrintFailed(p, err) => {
+                    post_notice("Drucken fehlgeschlagen", &format!("{}\n{err}", name(&p)), true)
+                }
                 _ => {}
             }
         })

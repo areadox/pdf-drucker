@@ -129,6 +129,13 @@ jobs:
           if (-not (Test-Path $druckOut)) { throw 'Automatischer Ausdruck ist nicht angekommen' }
           Write-Output "::notice title=Ausdruck::$((Get-Item $druckOut).Length) Bytes an 'Testdrucker'"
 
+          "== Tray-App starten (darf nicht abstürzen) =="
+          $t = Start-Process $exe -PassThru
+          Start-Sleep 5
+          if ($t.HasExited) { throw "Tray-App hat sich beendet (Exit $($t.ExitCode))" }
+          Stop-Process $t -Force
+          "Tray-App lief 5 Sekunden stabil."
+
           "== Drucker entfernen =="
           Run-App @('uninstall')
           if (Get-Printer -Name 'PDF-Ablage' -ErrorAction SilentlyContinue) { throw 'Drucker wurde nicht entfernt' }

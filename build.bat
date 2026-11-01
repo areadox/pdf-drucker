@@ -1,22 +1,24 @@
 @echo off
-rem Baut den Programmordner und – falls Inno Setup installiert ist – den Installer.
-rem Voraussetzung: Python 3.10+ (beim Setup "Add python.exe to PATH" anhaken)
-rem Optional:      Inno Setup 6 (https://jrsoftware.org/isdl.php) für PDF-Ablage-Setup.exe
+rem Baut PDF-Ablage (Rust) und - falls Inno Setup installiert ist - den Installer.
+rem Voraussetzung: Rust (https://rustup.rs)
+rem Optional:      Inno Setup 6 (https://jrsoftware.org/isdl.php) fuer PDF-Ablage-Setup.exe
 
 cd /d "%~dp0"
-echo === Pakete installieren ===
-python -m pip install --upgrade pyinstaller pystray pillow pywin32 pypdfium2 || goto :fehler
+echo === Programm bauen ===
+cargo build --release || goto :fehler
 
-echo === Symbol und Versionsinfo erzeugen ===
-python pdf_drucker.py make-icon icon.ico || goto :fehler
-python pdf_drucker.py make-versionfile version_info.txt || goto :fehler
+if not exist pdfium\bin\pdfium.dll (
+  echo === pdfium herunterladen ===
+  powershell -NoProfile -Command "Invoke-WebRequest https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-win-x64.tgz -OutFile pdfium.tgz" || goto :fehler
+  if not exist pdfium mkdir pdfium
+  tar -xzf pdfium.tgz -C pdfium || goto :fehler
+)
 
-echo === Programmordner bauen ===
-python -m PyInstaller --noconfirm --onedir --windowed ^
-  --name PDF-Ablage --icon icon.ico --version-file version_info.txt ^
-  --hidden-import pystray._win32 ^
-  --collect-all pypdfium2 --collect-all pypdfium2_raw ^
-  pdf_drucker.py || goto :fehler
+echo === Programmordner zusammenstellen ===
+if not exist dist\PDF-Ablage mkdir dist\PDF-Ablage
+copy /y target\release\PDF-Ablage.exe dist\PDF-Ablage\ >nul || goto :fehler
+copy /y pdfium\bin\pdfium.dll dist\PDF-Ablage\ >nul || goto :fehler
+if exist pdfium\LICENSE copy /y pdfium\LICENSE dist\PDF-Ablage\pdfium-LICENSE.txt >nul
 
 set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
 if not exist "%ISCC%" (
