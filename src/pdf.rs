@@ -61,7 +61,7 @@ impl PdfPrinter {
         }
         let dc = Dc(hdc);
 
-        let caps = |i| unsafe { GetDeviceCaps(dc.0, i) };
+        let caps = |i: u32| unsafe { GetDeviceCaps(dc.0, i as _) };
         let dpi = caps(LOGPIXELSX).min(caps(LOGPIXELSY)).clamp(72, MAX_DPI);
         let (paper_w, paper_h) = (caps(PHYSICALWIDTH), caps(PHYSICALHEIGHT));
         let (off_x, off_y) = (caps(PHYSICALOFFSETX), caps(PHYSICALOFFSETY));
