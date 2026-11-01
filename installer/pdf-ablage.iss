@@ -1,6 +1,6 @@
 ﻿; Inno-Setup-Skript für PDF-Ablage
 ; Bauen:  iscc /DMyAppVersion=1.2.3 installer\pdf-ablage.iss
-; Erwartet den PyInstaller-Ordner unter dist\PDF-Ablage und icon.ico im Hauptordner.
+; Erwartet den Programmordner unter dist\PDF-Ablage (PDF-Ablage.exe + pdfium.dll).
 
 #ifndef MyAppVersion
   #define MyAppVersion "0.0.0"
@@ -30,7 +30,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist
 OutputBaseFilename=PDF-Ablage-Setup
-SetupIconFile=..\icon.ico
+SetupIconFile=..\assets\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExe}
 UninstallDisplayName={#MyAppName}
 Compression=lzma2/max
@@ -46,7 +46,7 @@ Name: "autostart"; Description: "Beim Windows-Start automatisch starten"
 Name: "desktopicon"; Description: "Desktop-Verknüpfung anlegen"; Flags: unchecked
 
 [InstallDelete]
-; Alte Programmbibliotheken entfernen, damit nach Updates keine Reste bleiben
+; Reste der früheren Python-Version entfernen
 Type: filesandordirs; Name: "{app}\_internal"
 
 [Files]
@@ -62,6 +62,9 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: deskto
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; \
   ValueName: "{#MyAppName}"; ValueData: """{app}\{#MyAppExe}"""; Tasks: autostart; \
   Check: not IsUpdate; Flags: uninsdeletevalue
+; Autostart-Eintrag, den die App selbst gesetzt hat, bei der Deinstallation entfernen
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; \
+  ValueName: "{#MyAppName}"; Flags: uninsdeletevalue dontcreatekey
 
 [Run]
 ; Nach einem stillen Update die neue Version wieder starten

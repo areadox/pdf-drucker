@@ -1,7 +1,4 @@
-build/
+target/
 dist/
-*.spec
-icon.ico
-version_info.txt
-__pycache__/
-*.pyc
+pdfium/
+*.tgz

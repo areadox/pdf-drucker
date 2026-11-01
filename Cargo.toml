@@ -1,0 +1,45 @@
+[package]
+name = "pdf-ablage"
+version = "0.0.0" # wird beim Release-Build aus der Versionsnummer gesetzt
+edition = "2021"
+description = "Virtueller PDF-Drucker für Windows: speichert Ausdrucke automatisch in einen festen Ordner"
+authors = ["areadox"]
+repository = "https://github.com/areadox/pdf-drucker"
+build = "build.rs"
+
+[[bin]]
+name = "PDF-Ablage"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+pdfium-render = "0.8"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+winreg = "0.52"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Printing",
+    "Win32_Security",
+    "Win32_Storage_Xps",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

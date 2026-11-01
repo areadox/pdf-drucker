@@ -2,27 +2,26 @@ name: EXE bauen
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       version:
-        description: "Neue Version veröffentlichen (z. B. 1.1.0) – leer lassen für einen Test-Build"
+        description: "Neue Version veröffentlichen (z. B. 2.1.0) – leer lassen für einen Test-Build"
         required: false
         default: ""
 
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
 
       - name: Versionsnummer bestimmen
         id: ver
@@ -38,55 +37,101 @@ jobs:
             if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo "::error::Version muss die Form 1.2.3 haben (war: $VERSION)"; exit 1
             fi
-            sed -i "s/^APP_VERSION = .*/APP_VERSION = \"${VERSION}\"/" pdf_drucker.py
+            sed -i "0,/^version = .*/s//version = \"${VERSION}\"/" Cargo.toml
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "setup_version=${VERSION:-0.0.0}" >> "$GITHUB_OUTPUT"
-          grep '^APP_VERSION' pdf_drucker.py
+          grep -m1 '^version' Cargo.toml
 
-      - name: Pakete installieren
-        run: python -m pip install pyinstaller pystray pillow pywin32 pypdfium2
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Symbol und Versionsinfo erzeugen
-        run: |
-          python pdf_drucker.py make-icon icon.ico
-          python pdf_drucker.py make-versionfile version_info.txt
+      - name: Tests
+        run: cargo test --release
 
-      - name: Programmordner bauen (PyInstaller, ohne Selbstentpacken)
-        run: >
-          python -m PyInstaller --noconfirm --onedir --windowed
-          --name PDF-Ablage --icon icon.ico
-          --version-file version_info.txt
-          --hidden-import pystray._win32
-          --collect-all pypdfium2 --collect-all pypdfium2_raw
-          pdf_drucker.py
+      - name: Bauen
+        run: cargo build --release
 
-      - name: Selbsttest der gebauten EXE (Darstellung + Testdruck)
+      - name: pdfium bereitstellen und Programmordner zusammenstellen
         shell: pwsh
         run: |
-          $out = "$env:RUNNER_TEMP\testdruck.pdf"
-          $druck = ""
-          try {
-            Set-Service Spooler -StartupType Automatic -ErrorAction Stop
-            Start-Service Spooler -ErrorAction Stop
-            $drv = (Get-PrinterDriver | Where-Object { $_.Name -like '*Print*PDF*' } | Select-Object -First 1).Name
-            Add-PrinterPort -Name $out
-            Add-Printer -Name "Testdrucker" -DriverName $drv -PortName $out
-            $druck = "Testdrucker"
-          } catch {
-            Write-Output "::warning::Kein Drucker im Build verfügbar – nur Darstellung getestet: $_"
+          Invoke-WebRequest "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-win-x64.tgz" -OutFile pdfium.tgz
+          New-Item -ItemType Directory -Force pdfium | Out-Null
+          tar -xzf pdfium.tgz -C pdfium
+          New-Item -ItemType Directory -Force dist\PDF-Ablage | Out-Null
+          Copy-Item target\release\PDF-Ablage.exe dist\PDF-Ablage\
+          Copy-Item pdfium\bin\pdfium.dll dist\PDF-Ablage\
+          Copy-Item pdfium\LICENSE dist\PDF-Ablage\pdfium-LICENSE.txt -ErrorAction SilentlyContinue
+          Get-ChildItem dist\PDF-Ablage | Format-Table Name, Length
+
+      - name: End-to-End-Test (Drucker einrichten, Dokumentname, Ausdruck, Entfernen)
+        shell: pwsh
+        env:
+          PDF_ABLAGE_NO_GUI: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path 'dist\PDF-Ablage\PDF-Ablage.exe').Path
+          $tmp = $env:RUNNER_TEMP
+          function Run-App([string[]]$a) {
+            $p = Start-Process $exe -ArgumentList $a -Wait -PassThru -NoNewWindow `
+                 -RedirectStandardOutput "$tmp\out.txt" -RedirectStandardError "$tmp\err.txt"
+            Get-Content "$tmp\out.txt", "$tmp\err.txt" -ErrorAction SilentlyContinue | ForEach-Object { "  | $_" }
+            if ($p.ExitCode -ne 0) { throw "PDF-Ablage $($a -join ' ') -> Exit $($p.ExitCode)" }
           }
-          $erg = "$env:RUNNER_TEMP\selftest.txt"
-          $args_ = @("selftest", "--ergebnis", $erg)
-          if ($druck) { $args_ = @("selftest", $druck, "--ergebnis", $erg) }
-          $p = Start-Process "dist\PDF-Ablage\PDF-Ablage.exe" -ArgumentList $args_ -Wait -PassThru
-          Get-Content $erg | ForEach-Object { Write-Output "::notice title=Selbsttest::$_" }
-          if ($p.ExitCode -ne 0) { throw "Selbsttest fehlgeschlagen" }
-          if ($druck) {
-            for ($i = 0; $i -lt 30 -and -not (Test-Path $out); $i++) { Start-Sleep 1 }
-            if (-not (Test-Path $out)) { throw "Testdruck ist nicht angekommen" }
-            Write-Output "::notice title=Selbsttest::Testdruck angekommen: $((Get-Item $out).Length) Bytes"
+          $log = "$env:ProgramData\PDFDrucker\pdf_drucker.log"
+
+          Set-Service Spooler -StartupType Automatic
+          Start-Service Spooler
+
+          # Zweiter Drucker als Ziel für den automatischen Ausdruck
+          $druckOut = "$tmp\testdruck.pdf"
+          $drv = (Get-PrinterDriver | Where-Object { $_.Name -like '*Print*PDF*' } | Select-Object -First 1).Name
+          Add-PrinterPort -Name $druckOut
+          Add-Printer -Name 'Testdrucker' -DriverName $drv -PortName $druckOut
+
+          "== Selbsttest (pdfium) =="
+          Run-App @('selftest')
+
+          "== Drucker einrichten =="
+          $ziel = "$tmp\ziel"
+          Run-App @('install', '--ordner', $ziel)
+          $pr = Get-Printer -Name 'PDF-Ablage'
+          "KeepPrintedJobs: $($pr.KeepPrintedJobs)"
+          if (-not $pr.KeepPrintedJobs) { throw 'KeepPrintedJobs ist nicht gesetzt' }
+
+          $cfgFile = "$env:ProgramData\PDFDrucker\config.json"
+          $cfg = Get-Content $cfgFile -Raw | ConvertFrom-Json
+          $cfg.print_after_save = $true
+          $cfg.print_printer = 'Testdrucker'
+          $cfg | ConvertTo-Json | Set-Content $cfgFile -Encoding utf8
+
+          "== Überwachung starten und Testdokument drucken =="
+          Run-App @('make-test-pdf', "$tmp\Testdokument.pdf")
+          $w = Start-Process $exe -ArgumentList 'run' -PassThru -NoNewWindow
+          Start-Sleep 2
+          Run-App @('print', "$tmp\Testdokument.pdf", 'PDF-Ablage')
+
+          $found = $null
+          for ($i = 0; $i -lt 40 -and -not $found; $i++) {
+            Start-Sleep 1
+            $found = Get-ChildItem $ziel -Filter '*.pdf' -ErrorAction SilentlyContinue | Select-Object -First 1
           }
+          for ($i = 0; $i -lt 40 -and -not (Test-Path $druckOut); $i++) { Start-Sleep 1 }
+          Start-Sleep 1
+          Stop-Process $w -Force -ErrorAction SilentlyContinue
+          "== Protokoll =="
+          Get-Content $log -ErrorAction SilentlyContinue | ForEach-Object { "  | $_" }
+          "== Restliche Aufträge in der Warteschlange =="
+          Get-PrintJob -PrinterName 'PDF-Ablage' | Format-Table Id, DocumentName, JobStatus
+
+          if (-not $found) { throw 'Keine PDF im Zielordner angekommen' }
+          Write-Output "::notice title=Dateiname::$($found.Name)"
+          if ($found.Name -notlike '*Testdokument*') { throw "Dokumentname fehlt im Dateinamen: $($found.Name)" }
+          if (-not (Test-Path $druckOut)) { throw 'Automatischer Ausdruck ist nicht angekommen' }
+          Write-Output "::notice title=Ausdruck::$((Get-Item $druckOut).Length) Bytes an 'Testdrucker'"
+
+          "== Drucker entfernen =="
+          Run-App @('uninstall')
+          if (Get-Printer -Name 'PDF-Ablage' -ErrorAction SilentlyContinue) { throw 'Drucker wurde nicht entfernt' }
 
       - name: Inno Setup bereitstellen
         shell: pwsh
