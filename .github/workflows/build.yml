@@ -218,6 +218,29 @@ jobs:
           Run-App @('uninstall')
           if ((Our-Printers).Count -gt 0) { throw 'Drucker wurden nicht entfernt' }
 
+      - name: Bildschirmfoto Einstellungsfenster
+        shell: pwsh
+        continue-on-error: true
+        env:
+          PDF_ABLAGE_NO_GUI: "1"
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $exe = (Resolve-Path 'dist\PDF-Ablage\PDF-Ablage.exe').Path
+          $s = Start-Process $exe -ArgumentList 'einstellungen' -PassThru
+          Start-Sleep 4
+          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $w = [Math]::Min(800, $b.Width); $h = [Math]::Min(480, $b.Height)
+          $x = [int](($b.Width - $w) / 2); $y = [int](($b.Height - $h) / 2)
+          $bmp = New-Object System.Drawing.Bitmap $w, $h
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.CopyFromScreen($x, $y, 0, 0, (New-Object System.Drawing.Size $w, $h))
+          $bmp.Save("$env:RUNNER_TEMP\einstellungen.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          Stop-Process $s -Force -ErrorAction SilentlyContinue
+          "Bildschirm: $($b.Width)x$($b.Height)"
+          "BILD-ANFANG"
+          [Convert]::ToBase64String([IO.File]::ReadAllBytes("$env:RUNNER_TEMP\einstellungen.png")) -split '(.{4000})' | Where-Object { $_ }
+          "BILD-ENDE"
+
       - name: Inno Setup bereitstellen
         shell: pwsh
         run: |
