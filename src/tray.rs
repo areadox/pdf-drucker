@@ -468,7 +468,12 @@ pub fn run(after_update: bool) -> Result<i32> {
             let notify = cfg.lock().map(|c| c.notify).unwrap_or(true);
             let name = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             match e {
-                Event::Saved(p) if notify => post_notice("PDF gespeichert", &name(&p), false),
+                Event::Saved(p, 1) if notify => post_notice("PDF gespeichert", &name(&p), false),
+                Event::Saved(p, n) if notify => {
+                    post_notice("PDF gespeichert", &format!("{}\nin {n} Speicherorten", name(&p)), false)
+                }
+                // Fehler immer melden, auch wenn Benachrichtigungen aus sind
+                Event::SaveFailed(dir, err) => post_notice("Speicherort nicht erreichbar", &format!("{dir}\n{err}"), true),
                 Event::Printed(p, printer) if notify => {
                     post_notice("Ausgedruckt", &format!("{}\n→ {printer}", name(&p)), false)
                 }

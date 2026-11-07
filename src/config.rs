@@ -12,6 +12,8 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const GITHUB_REPO: &str = "areadox/pdf-drucker";
 pub const SETUP_ASSET: &str = "PDF-Ablage-Setup.exe";
 pub const MAX_PRINTERS: usize = 5;
+/// Speicherorte je Drucker (Hauptordner + bis zu 4 weitere)
+pub const MAX_DIRS: usize = 5;
 pub const DEFAULT_PATTERN: &str = "{datum}_{zeit}_{titel}";
 
 /// Entwicklungs-Builds (ohne Versionsnummer) suchen nicht nach Updates.
@@ -67,7 +69,10 @@ pub struct PrinterConfig {
     pub id: u8,
     /// Name des Druckers in Windows
     pub name: String,
+    /// Hauptordner (für „Zielordner öffnen“, „Nach dem Speichern öffnen“ und den Ausdruck)
     pub target_dir: String,
+    /// Weitere Speicherorte – die PDF wird zusätzlich in jedem davon gespeichert (bis zu 4)
+    pub extra_dirs: Vec<String>,
     /// Platzhalter: {datum} {zeit} {titel}
     pub filename_pattern: String,
     pub open_after_save: bool,
@@ -83,6 +88,7 @@ impl PrinterConfig {
             id,
             target_dir: documents_dir().join(&name).to_string_lossy().into_owned(),
             name,
+            extra_dirs: Vec::new(),
             filename_pattern: DEFAULT_PATTERN.into(),
             open_after_save: false,
             print_after_save: false,
@@ -93,6 +99,31 @@ impl PrinterConfig {
     pub fn pipe(&self) -> String {
         pipe_name(self.id)
     }
+
+    /// Alle Speicherorte: Hauptordner zuerst, ohne leere und doppelte, höchstens 5.
+    pub fn all_dirs(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for d in std::iter::once(&self.target_dir).chain(self.extra_dirs.iter()) {
+            let d = d.trim();
+            if !d.is_empty() && !out.iter().any(|o| same_dir(o, d)) {
+                out.push(d.to_string());
+            }
+        }
+        out.truncate(MAX_DIRS);
+        out
+    }
+
+    /// Setzt die Speicherorte (erster = Hauptordner).
+    pub fn set_dirs(&mut self, dirs: &[String]) {
+        self.target_dir = dirs.first().cloned().unwrap_or_default();
+        self.extra_dirs = dirs.iter().skip(1).take(MAX_DIRS - 1).cloned().collect();
+    }
+}
+
+/// Gleicher Ordner? (Groß-/Kleinschreibung und abschließender Backslash egal)
+pub fn same_dir(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_end_matches(['\\', '/']).to_lowercase();
+    norm(a) == norm(b)
 }
 
 impl Default for PrinterConfig {
@@ -180,6 +211,10 @@ impl Config {
             used.push(p.id);
             if p.filename_pattern.trim().is_empty() {
                 p.filename_pattern = DEFAULT_PATTERN.into();
+            }
+            let dirs = p.all_dirs();
+            if !dirs.is_empty() {
+                p.set_dirs(&dirs);
             }
         }
     }
@@ -286,6 +321,19 @@ mod tests {
         assert_eq!(ids, vec![1, 2, 3, 4, 5]);
         assert_eq!(Config::free_id(&c.printers), None);
         assert_eq!(pipe_name(3), r"\\.\pipe\PDFAblage-3");
+    }
+
+    #[test]
+    fn speicherorte() {
+        let c = parse(r#"{"printers":[{"id":1,"name":"A","target_dir":"C:\\Ablage",
+            "extra_dirs":["D:\\Kopie","","c:\\ablage\\","E:\\B","F:\\C","G:\\D","H:\\E"]}]}"#);
+        let p = &c.printers[0];
+        assert_eq!(p.all_dirs(), vec![r"C:\Ablage", r"D:\Kopie", r"E:\B", r"F:\C", r"G:\D"]);
+        assert_eq!(p.extra_dirs.len(), 4);
+        // Ältere Konfiguration ohne extra_dirs
+        let alt = parse(r#"{"printers":[{"id":1,"name":"A","target_dir":"C:\\Ablage"}]}"#);
+        assert_eq!(alt.printers[0].all_dirs(), vec![r"C:\Ablage"]);
+        assert!(same_dir(r"C:\X\", r"c:\x"));
     }
 
     #[test]

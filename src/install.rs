@@ -74,8 +74,10 @@ pub fn sync_printers(cfg: &Config) -> Result<String> {
     }
     std::fs::create_dir_all(config::app_dir())?;
     for p in &cfg.printers {
-        if let Err(e) = std::fs::create_dir_all(&p.target_dir) {
-            log_warn!("Zielordner {} nicht anlegbar: {e}", p.target_dir);
+        for dir in p.all_dirs() {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                log_warn!("Speicherort {dir} nicht anlegbar: {e}");
+            }
         }
     }
     config::save(cfg)?;
@@ -147,7 +149,7 @@ foreach ($port in @(Get-PrinterPort | Where-Object {{ IsOur $_.Name }})) {{
     if !ok {
         bail!("Fehler beim Einrichten der Drucker:\n{text}");
     }
-    let list: Vec<String> = cfg.printers.iter().map(|p| format!("• {} → {}", p.name, p.target_dir)).collect();
+    let list: Vec<String> = cfg.printers.iter().map(|p| format!("• {} → {}", p.name, p.all_dirs().join(" + "))).collect();
     log_info!("Drucker abgeglichen: {}", list.join("; "));
     Ok(format!("Drucker eingerichtet:\n{}", list.join("\n")))
 }

@@ -25,7 +25,10 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 pub enum Event {
-    Saved(PathBuf),
+    /// Gespeichert: erste Datei, Anzahl der Speicherorte
+    Saved(PathBuf, usize),
+    /// Ein Speicherort war nicht beschreibbar: Ordner, Fehler
+    SaveFailed(String, String),
     Printed(PathBuf, String),
     PrintFailed(PathBuf, String),
 }
@@ -79,7 +82,7 @@ impl Receiver {
         let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
         for p in printers {
             if started.insert(p.id) {
-                log_info!("Empfange Druckaufträge für „{}“ über {} -> {}", p.name, p.pipe(), p.target_dir);
+                log_info!("Empfange Druckaufträge für „{}“ über {} -> {}", p.name, p.pipe(), p.all_dirs().join(" + "));
                 let me = self.clone();
                 thread::spawn(move || me.serve(p.id));
             }
@@ -216,8 +219,6 @@ fn save_job(
         .filter(|d| !d.is_empty())
         .unwrap_or_else(|| "Druck".into());
 
-    let target = PathBuf::from(&p.target_dir);
-    std::fs::create_dir_all(&target).with_context(|| format!("Zielordner {} nicht anlegbar", target.display()))?;
     let now = chrono::Local::now();
     let stem = logic::render_pattern(
         &p.filename_pattern,
@@ -225,26 +226,53 @@ fn save_job(
         &now.format("%H-%M-%S").to_string(),
         &titel,
     );
-    let dst = logic::unique_path(&target, &logic::safe_name(&stem, 150));
-    // Erst unter Zwischennamen schreiben, damit z. B. Nextcloud keine halbe Datei synchronisiert
-    let part = dst.with_extension("pdf.part");
-    std::fs::write(&part, data).with_context(|| format!("{} nicht schreibbar", part.display()))?;
-    std::fs::rename(&part, &dst)?;
-    log_info!("Gespeichert ({}): {}", p.name, dst.display());
+    let stem = logic::safe_name(&stem, 150);
+
+    // In jedem Speicherort ablegen; ein nicht erreichbarer Ordner verhindert die anderen nicht
+    let mut saved: Vec<PathBuf> = Vec::new();
+    for dir in p.all_dirs() {
+        match save_to(Path::new(&dir), &stem, data) {
+            Ok(dst) => {
+                log_info!("Gespeichert ({}): {}", p.name, dst.display());
+                saved.push(dst);
+            }
+            Err(e) => {
+                log_error!("Speicherort {dir} ({}): {e:#}", p.name);
+                (events.as_ref())(Event::SaveFailed(dir, format!("{e:#}")));
+            }
+        }
+    }
+    let Some(first) = saved.first().cloned() else {
+        bail!("Die PDF konnte in keinem Speicherort abgelegt werden.");
+    };
 
     if p.open_after_save {
-        ui::open(&dst);
+        ui::open(&first);
     }
-    (events.as_ref())(Event::Saved(dst.clone()));
+    (events.as_ref())(Event::Saved(first.clone(), saved.len()));
     if p.print_after_save {
         match resolve_print_printer(c, p) {
             Ok(target) => {
-                let _ = print_tx.send((dst, target));
+                let _ = print_tx.send((first, target));
             }
-            Err(e) => (events.as_ref())(Event::PrintFailed(dst, format!("{e:#}"))),
+            Err(e) => (events.as_ref())(Event::PrintFailed(first, format!("{e:#}"))),
         }
     }
     Ok(())
+}
+
+/// Legt die PDF in `dir` ab (eindeutiger Name, erst als .part, dann umbenannt).
+fn save_to(dir: &Path, stem: &str, data: &[u8]) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("Ordner {} nicht erreichbar oder nicht anlegbar", dir.display()))?;
+    let dst = logic::unique_path(dir, stem);
+    // Erst unter Zwischennamen schreiben, damit z. B. Nextcloud keine halbe Datei synchronisiert
+    let part = dst.with_extension("pdf.part");
+    std::fs::write(&part, data).with_context(|| format!("{} nicht schreibbar", part.display()))?;
+    if let Err(e) = std::fs::rename(&part, &dst) {
+        let _ = std::fs::remove_file(&part);
+        return Err(e).with_context(|| format!("{} nicht anlegbar", dst.display()));
+    }
+    Ok(dst)
 }
 
 /// Zieldrucker für den zusätzlichen Ausdruck; nie ein PDF-Ablage-Drucker (Endlosschleife).

@@ -2,7 +2,7 @@
 //!
 //! Läuft im Haupt-Thread der Tray-App (oder eigenständig über den Befehl "einstellungen").
 
-use crate::config::{self, Config, PrinterConfig, APP_NAME, MAX_PRINTERS};
+use crate::config::{self, Config, PrinterConfig, APP_NAME, MAX_DIRS, MAX_PRINTERS};
 use crate::util::wide;
 use crate::{install, spooler, ui};
 use std::cell::RefCell;
@@ -33,8 +33,10 @@ const IDC_LIST: i32 = 101;
 const IDC_ADD: i32 = 102;
 const IDC_REMOVE: i32 = 103;
 const IDC_NAME: i32 = 110;
-const IDC_DIR: i32 = 111;
-const IDC_BROWSE: i32 = 112;
+const IDC_DIRS: i32 = 111;
+const IDC_DIR_ADD: i32 = 112;
+const IDC_DIR_EDIT: i32 = 117;
+const IDC_DIR_REMOVE: i32 = 118;
 const IDC_PATTERN: i32 = 113;
 const IDC_OPEN: i32 = 114;
 const IDC_PRINT: i32 = 115;
@@ -64,6 +66,7 @@ const CB_RESETCONTENT: u32 = 0x014B;
 const CB_SETCURSEL: u32 = 0x014E;
 const BN_CLICKED: u32 = 0;
 const LBN_SELCHANGE: u32 = 1;
+const LBN_DBLCLK: u32 = 2;
 
 const CLASS: &str = "PDFAblageSettingsWnd";
 
@@ -77,6 +80,8 @@ struct Settings {
     current: usize,
     /// Einträge der Druckerauswahl ab Index 1 (Index 0 = Windows-Standarddrucker)
     targets: Vec<String>,
+    /// Speicherorte des gewählten Druckers (erster = Hauptordner)
+    dirs: Vec<String>,
 }
 
 thread_local! {
@@ -129,7 +134,8 @@ impl Settings {
         let targets = self.targets.clone();
         let Some(p) = self.working.get_mut(self.current) else { return };
         p.name = text(h, IDC_NAME).trim().to_string();
-        p.target_dir = text(h, IDC_DIR).trim().to_string();
+        let dirs = self.dirs.clone();
+        p.set_dirs(&dirs);
         p.filename_pattern = text(h, IDC_PATTERN).trim().to_string();
         p.open_after_save = checked(h, IDC_OPEN);
         p.print_after_save = checked(h, IDC_PRINT);
@@ -142,7 +148,8 @@ impl Settings {
         let h = self.hwnd;
         let Some(p) = self.working.get(self.current).cloned() else { return };
         set_text(h, IDC_NAME, &p.name);
-        set_text(h, IDC_DIR, &p.target_dir);
+        self.dirs = p.all_dirs();
+        self.refresh_dirs(0);
         set_text(h, IDC_PATTERN, &p.filename_pattern);
         set_checked(h, IDC_OPEN, p.open_after_save);
         set_checked(h, IDC_PRINT, p.print_after_save);
@@ -187,6 +194,28 @@ impl Settings {
         enable(h, IDC_REMOVE, self.working.len() > 1);
     }
 
+    /// Liste der Speicherorte neu aufbauen und `sel` auswählen.
+    fn refresh_dirs(&mut self, sel: usize) {
+        let h = self.hwnd;
+        send(h, IDC_DIRS, LB_RESETCONTENT, 0, 0);
+        for (i, d) in self.dirs.iter().enumerate() {
+            let label = if i == 0 { format!("{d}   (Hauptordner)") } else { d.clone() };
+            let w = wide(&label);
+            send(h, IDC_DIRS, LB_ADDSTRING, 0, w.as_ptr() as LPARAM);
+        }
+        if !self.dirs.is_empty() {
+            send(h, IDC_DIRS, LB_SETCURSEL, sel.min(self.dirs.len() - 1), 0);
+        }
+        enable(h, IDC_DIR_ADD, self.dirs.len() < MAX_DIRS);
+        enable(h, IDC_DIR_EDIT, !self.dirs.is_empty());
+        enable(h, IDC_DIR_REMOVE, self.dirs.len() > 1);
+    }
+
+    fn selected_dir(&self) -> Option<usize> {
+        let sel = send(self.hwnd, IDC_DIRS, LB_GETCURSEL, 0, 0);
+        (sel >= 0 && (sel as usize) < self.dirs.len()).then_some(sel as usize)
+    }
+
     fn add(&mut self) {
         self.store();
         let Some(id) = Config::free_id(&self.working) else { return };
@@ -225,8 +254,8 @@ fn validate(working: &[PrinterConfig], saved: &Config) -> Result<(), String> {
             return Err(format!("Der Name „{}“ ist doppelt vergeben.", p.name));
         }
         names.push(&p.name);
-        if p.target_dir.is_empty() {
-            return Err(format!("Bitte für „{}“ einen Zielordner angeben.", p.name));
+        if p.all_dirs().is_empty() {
+            return Err(format!("Bitte für „{}“ mindestens einen Speicherort angeben.", p.name));
         }
         // Name darf nicht zu einem fremden Drucker gehören
         if let Some(port) = spooler::port_name(&p.name) {
@@ -286,15 +315,61 @@ fn save() {
     with(|st| st.refresh());
 }
 
-fn browse() {
-    let Some((hwnd, current)) = with(|st| (st.hwnd, text(st.hwnd, IDC_DIR))) else { return };
-    let picked = rfd::FileDialog::new()
-        .set_title("Zielordner für PDFs wählen")
-        .set_directory(&current)
-        .pick_folder();
-    if let Some(folder) = picked {
-        set_text(hwnd, IDC_DIR, &folder.to_string_lossy());
+fn pick_folder(start: &str) -> Option<String> {
+    rfd::FileDialog::new()
+        .set_title("Speicherort für PDFs wählen")
+        .set_directory(start)
+        .pick_folder()
+        .map(|f| f.to_string_lossy().into_owned())
+}
+
+/// Speicherort hinzufügen (`index` = None) oder ändern.
+fn edit_dir(index: Option<usize>) {
+    let Some((start, others)) = with(|st| {
+        let start = index
+            .and_then(|i| st.dirs.get(i).cloned())
+            .or_else(|| st.dirs.first().cloned())
+            .unwrap_or_default();
+        let others: Vec<String> =
+            st.dirs.iter().enumerate().filter(|(i, _)| Some(*i) != index).map(|(_, d)| d.clone()).collect();
+        (start, others)
+    }) else {
+        return;
+    };
+    // Dialog außerhalb des Fensterzustands öffnen (er hat eine eigene Nachrichtenschleife)
+    let Some(folder) = pick_folder(&start) else { return };
+    if others.iter().any(|d| config::same_dir(d, &folder)) {
+        ui::message(&format!("„{folder}“ ist bereits ein Speicherort dieses Druckers."), true);
+        return;
     }
+    with(|st| {
+        let sel = match index {
+            Some(i) if i < st.dirs.len() => {
+                st.dirs[i] = folder;
+                i
+            }
+            _ => {
+                if st.dirs.len() >= MAX_DIRS {
+                    return;
+                }
+                st.dirs.push(folder);
+                st.dirs.len() - 1
+            }
+        };
+        st.refresh_dirs(sel);
+    });
+}
+
+fn remove_dir() {
+    with(|st| {
+        if st.dirs.len() <= 1 {
+            return;
+        }
+        if let Some(i) = st.selected_dir() {
+            st.dirs.remove(i);
+            st.refresh_dirs(i.saturating_sub(1));
+        }
+    });
 }
 
 fn close(hwnd: HWND) {
@@ -338,7 +413,13 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
                 }
             }
         }
-        (IDC_BROWSE, BN_CLICKED) => browse(),
+        (IDC_DIR_ADD, BN_CLICKED) => edit_dir(None),
+        (IDC_DIR_EDIT, BN_CLICKED) | (IDC_DIRS, LBN_DBLCLK) => {
+            if let Some(i) = with(|st| st.selected_dir()).flatten() {
+                edit_dir(Some(i));
+            }
+        }
+        (IDC_DIR_REMOVE, BN_CLICKED) => remove_dir(),
         (IDC_SAVE, BN_CLICKED) | (IDOK, _) => save(),
         (IDC_CLOSE, BN_CLICKED) | (IDCANCEL, _) => close(hwnd),
         _ => {}
@@ -413,7 +494,7 @@ pub fn open(cfg: Arc<Mutex<Config>>, on_saved: Option<Hook>, standalone: bool) {
         let font = CreateFontIndirectW(&ncm.lfMessageFont);
 
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-        let mut rect = RECT { left: 0, top: 0, right: sc(660), bottom: sc(340) };
+        let mut rect = RECT { left: 0, top: 0, right: sc(660), bottom: sc(420) };
         AdjustWindowRectEx(&mut rect, style, 0, 0);
         let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
         let x = ((GetSystemMetrics(SM_CXSCREEN) - w) / 2).max(0);
@@ -446,27 +527,29 @@ pub fn open(cfg: Arc<Mutex<Config>>, on_saved: Option<Hook>, standalone: bool) {
 
         // Links: Druckerliste
         ctl("STATIC", "PDF-Drucker (höchstens 5):", 0, 0, (12, 12, 190, 18), IDC_LABEL);
-        ctl("LISTBOX", "", WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, WS_EX_CLIENTEDGE, (12, 32, 190, 254), IDC_LIST);
-        ctl("BUTTON", "Hinzufügen", WS_TABSTOP, 0, (12, 294, 93, 28), IDC_ADD);
-        ctl("BUTTON", "Entfernen", WS_TABSTOP, 0, (109, 294, 93, 28), IDC_REMOVE);
+        ctl("LISTBOX", "", WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, WS_EX_CLIENTEDGE, (12, 32, 190, 334), IDC_LIST);
+        ctl("BUTTON", "Hinzufügen", WS_TABSTOP, 0, (12, 374, 93, 28), IDC_ADD);
+        ctl("BUTTON", "Entfernen", WS_TABSTOP, 0, (109, 374, 93, 28), IDC_REMOVE);
 
         // Rechts: Einstellungen des gewählten Druckers
         let x = 220;
         ctl("STATIC", "Name des Druckers (so erscheint er beim Drucken):", 0, 0, (x, 12, 428, 18), IDC_LABEL);
         ctl("EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, (x, 32, 428, 24), IDC_NAME);
-        ctl("STATIC", "Zielordner:", 0, 0, (x, 66, 428, 18), IDC_LABEL);
-        ctl("EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, (x, 86, 338, 24), IDC_DIR);
-        ctl("BUTTON", "Wählen …", WS_TABSTOP, 0, (x + 344, 85, 84, 26), IDC_BROWSE);
-        ctl("STATIC", "Dateiname (Platzhalter: {datum} {zeit} {titel}):", 0, 0, (x, 120, 428, 18), IDC_LABEL);
-        ctl("EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, (x, 140, 428, 24), IDC_PATTERN);
-        ctl("BUTTON", "PDF nach dem Speichern öffnen", WS_TABSTOP | BS_AUTOCHECKBOX, 0, (x, 176, 428, 22), IDC_OPEN);
-        ctl("BUTTON", "PDF zusätzlich ausdrucken auf:", WS_TABSTOP | BS_AUTOCHECKBOX, 0, (x, 204, 428, 22), IDC_PRINT);
-        ctl("COMBOBOX", "", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 0, (x + 20, 230, 408, 240), IDC_TARGET);
+        ctl("STATIC", "Speicherorte (bis zu 5 – die PDF wird in allen gespeichert):", 0, 0, (x, 66, 428, 18), IDC_LABEL);
+        ctl("LISTBOX", "", WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, WS_EX_CLIENTEDGE, (x, 86, 338, 98), IDC_DIRS);
+        ctl("BUTTON", "Hinzufügen …", WS_TABSTOP, 0, (x + 344, 86, 84, 28), IDC_DIR_ADD);
+        ctl("BUTTON", "Ändern …", WS_TABSTOP, 0, (x + 344, 121, 84, 28), IDC_DIR_EDIT);
+        ctl("BUTTON", "Entfernen", WS_TABSTOP, 0, (x + 344, 156, 84, 28), IDC_DIR_REMOVE);
+        ctl("STATIC", "Dateiname (Platzhalter: {datum} {zeit} {titel}):", 0, 0, (x, 196, 428, 18), IDC_LABEL);
+        ctl("EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, (x, 216, 428, 24), IDC_PATTERN);
+        ctl("BUTTON", "PDF nach dem Speichern öffnen (aus dem Hauptordner)", WS_TABSTOP | BS_AUTOCHECKBOX, 0, (x, 252, 428, 22), IDC_OPEN);
+        ctl("BUTTON", "PDF zusätzlich ausdrucken auf:", WS_TABSTOP | BS_AUTOCHECKBOX, 0, (x, 280, 428, 22), IDC_PRINT);
+        ctl("COMBOBOX", "", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 0, (x + 20, 306, 408, 240), IDC_TARGET);
 
         // Unten
-        ctl("STATIC", "", 0, 0, (x, 268, 428, 20), IDC_STATUS);
-        ctl("BUTTON", "Speichern", WS_TABSTOP | BS_DEFPUSHBUTTON, 0, (x + 254, 294, 84, 28), IDC_SAVE);
-        ctl("BUTTON", "Schließen", WS_TABSTOP, 0, (x + 344, 294, 84, 28), IDC_CLOSE);
+        ctl("STATIC", "", 0, 0, (x, 342, 428, 20), IDC_STATUS);
+        ctl("BUTTON", "Speichern", WS_TABSTOP | BS_DEFPUSHBUTTON, 0, (x + 254, 374, 84, 28), IDC_SAVE);
+        ctl("BUTTON", "Schließen", WS_TABSTOP, 0, (x + 344, 374, 84, 28), IDC_CLOSE);
 
         let working = cfg.lock().map(|c| c.printers.clone()).unwrap_or_default();
         SETTINGS.with(|s| {
@@ -479,6 +562,7 @@ pub fn open(cfg: Arc<Mutex<Config>>, on_saved: Option<Hook>, standalone: bool) {
                 working,
                 current: 0,
                 targets: Vec::new(),
+                dirs: Vec::new(),
             })
         });
         with(|st| {

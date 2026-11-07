@@ -137,9 +137,12 @@ jobs:
           $ziel2 = "$tmp\ziel2"; $ziel3 = "$tmp\ziel3"
           Edit-Config {
             param($c)
+            # Drucker 2 speichert in drei Ordnern, Drucker 3 hat einen nicht erreichbaren zweiten Ordner
             $c.printers += [pscustomobject]@{ id = 2; name = 'PDF-Ablage Rechnungen'; target_dir = $ziel2;
+              extra_dirs = @("$tmp\ziel2b", "$tmp\ziel2c");
               filename_pattern = 'Rechnung_{titel}'; open_after_save = $false; print_after_save = $false; print_printer = '' }
             $c.printers += [pscustomobject]@{ id = 3; name = 'PDF-Ablage Belege'; target_dir = $ziel3;
+              extra_dirs = @('Q:\gibt-es-nicht');
               filename_pattern = '{datum}_{titel}'; open_after_save = $false; print_after_save = $false; print_printer = '' }
           }
           Run-App @('sync')
@@ -166,6 +169,14 @@ jobs:
           Check-Names $f2 $n2
           Check-Names $f3 $n3
           if (@($f2 | Where-Object Name -notlike 'Rechnung_*').Count -gt 0) { throw 'Dateiname-Muster von Drucker 2 nicht angewendet' }
+          foreach ($d in @("$tmp\ziel2b", "$tmp\ziel2c")) {
+            $fx = Wait-Files $d 3 30
+            "${d}:"; $fx | ForEach-Object { "  $($_.Name)" }
+            Check-Names $fx $n2
+          }
+          Write-Output "::notice title=Mehrere Speicherorte::Rechnungen in allen 3 Speicherorten von Drucker 2 angekommen"
+          if (-not (Select-String -Path $log -Pattern 'Speicherort Q:' -Quiet)) { throw 'Nicht erreichbarer Speicherort wurde nicht gemeldet' }
+          "Nicht erreichbarer Speicherort von Drucker 3 wurde gemeldet, Belege trotzdem im Hauptordner: ok"
           Write-Output "::notice title=Mehrere Drucker::10 von 10 Dokumenten auf 3 Druckern im richtigen Ordner mit richtigem Namen"
           if (-not (Test-Path $druckOut)) { throw 'Automatischer Ausdruck ist nicht angekommen' }
 
@@ -228,6 +239,10 @@ jobs:
         run: |
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
           $exe = (Resolve-Path 'dist\PDF-Ablage\PDF-Ablage.exe').Path
+          $cfgFile = "$env:ProgramData\PDFDrucker\config.json"
+          $c = Get-Content $cfgFile -Raw | ConvertFrom-Json
+          $c.printers[0] | Add-Member -Force -NotePropertyName extra_dirs -NotePropertyValue @('D:\Nextcloud\PDFS', '\\nas\ablage\pdf')
+          $c | ConvertTo-Json -Depth 10 | Set-Content $cfgFile -Encoding utf8
           $s = Start-Process $exe -ArgumentList 'einstellungen' -PassThru
           Start-Sleep 4
           $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
