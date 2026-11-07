@@ -341,7 +341,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TRAY => {
             match (lp as u32) & 0xFFFF {
                 WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd),
-                WM_LBUTTONDBLCLK => open_target(0),
+                WM_LBUTTONDBLCLK => open_settings(),
                 _ => {}
             }
             0
