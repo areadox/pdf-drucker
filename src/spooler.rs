@@ -143,25 +143,6 @@ pub fn default_printer() -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..end]))
 }
 
-/// Der Auftrag, den Windows gerade an den Anschluss übergibt.
-pub fn current_job(printer: &str) -> Option<Job> {
-    let p = Printer::open(printer)?;
-    for attempt in 0..10 {
-        let jobs = p.jobs();
-        if let Some(j) = jobs.iter().filter(|j| j.status & JOB_STATUS_PRINTING != 0).min_by_key(|j| j.id) {
-            return Some(j.clone());
-        }
-        // Status noch nicht aktualisiert: ältester offener Auftrag ist der, der gerade läuft
-        if attempt >= 3 {
-            if let Some(j) = jobs.iter().filter(|j| !j.finished()).min_by_key(|j| j.id) {
-                return Some(j.clone());
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    None
-}
-
 /// Der Auftrag, der gerade auf einem der Drucker läuft (alle teilen sich einen Anschluss,
 /// daher läuft immer nur einer). Gibt Drucker-Nr. und Auftrag zurück.
 pub fn current_job_any(printers: &[(u8, String)]) -> Option<(u8, Job)> {
