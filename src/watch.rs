@@ -8,7 +8,7 @@ use crate::config::{self, Config, PrinterConfig};
 use crate::util::wide;
 use crate::{logic, pdf, spooler, ui};
 use anyhow::{bail, Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::mpsc::{self, Sender};
@@ -40,7 +40,11 @@ pub struct Receiver {
     cfg: Arc<Mutex<Config>>,
     job_tx: Sender<Job>,
     started: Mutex<HashSet<u8>>,
+    /// Neustarts leerer Aufträge je (Drucker-Nr., Auftrags-ID)
+    restarts: Mutex<HashMap<(u8, u32), u8>>,
 }
+
+const MAX_RESTARTS: u8 = 3;
 
 impl Receiver {
     pub fn start(cfg: Arc<Mutex<Config>>, events: Events) -> Arc<Receiver> {
@@ -59,7 +63,12 @@ impl Receiver {
                 }
             });
         }
-        let r = Arc::new(Receiver { cfg, job_tx, started: Mutex::new(HashSet::new()) });
+        let r = Arc::new(Receiver {
+            cfg,
+            job_tx,
+            started: Mutex::new(HashSet::new()),
+            restarts: Mutex::new(HashMap::new()),
+        });
         r.ensure_servers();
         r
     }
@@ -77,7 +86,7 @@ impl Receiver {
         }
     }
 
-    fn serve(&self, id: u8) {
+    fn serve(self: Arc<Self>, id: u8) {
         let pipe = config::pipe_name(id);
         let name = wide(&pipe);
         let mut failures = 0u32;
@@ -90,7 +99,9 @@ impl Receiver {
                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                     PIPE_UNLIMITED_INSTANCES,
                     0,
-                    1 << 20,
+                    // Kleiner Puffer: Windows wartet beim Schreiben auf uns, so bleibt der Auftrag
+                    // "wird gedruckt", bis wir seinen Dokumentnamen gelesen haben
+                    64 * 1024,
                     0,
                     null(),
                 )
@@ -110,26 +121,56 @@ impl Receiver {
                 unsafe { CloseHandle(h) };
                 continue;
             }
-            // Genau jetzt läuft der Auftrag, der in die Pipe schreibt -> Dokumentname passt sicher
-            let printer = lock(&self.cfg).printer(id).map(|p| p.name.clone());
-            let doc = printer.and_then(|n| spooler::current_document_name(&n));
             // Lesen in eigenem Thread, damit sofort die nächste Pipe-Instanz bereitsteht
-            let (h, job_tx) = (h as usize, self.job_tx.clone());
-            thread::spawn(move || {
-                let h = h as HANDLE;
-                let data = read_all(h);
-                unsafe {
-                    DisconnectNamedPipe(h);
-                    CloseHandle(h);
-                }
-                match data {
-                    Ok(data) => {
-                        let _ = job_tx.send((id, data, doc));
-                    }
-                    Err(e) => log_error!("Druckauftrag konnte nicht gelesen werden: {e:#}"),
-                }
-            });
+            let (h, me) = (h as usize, self.clone());
+            thread::spawn(move || me.receive(id, h as HANDLE));
         }
+    }
+
+    /// Liest einen Auftrag aus der verbundenen Pipe.
+    fn receive(&self, id: u8, h: HANDLE) {
+        // Genau jetzt läuft der Auftrag, der in die Pipe schreibt -> Dokumentname passt sicher
+        let printer = lock(&self.cfg).printer(id).map(|p| p.name.clone());
+        let job = printer.as_deref().and_then(spooler::current_job);
+        let data = read_all(h);
+        unsafe {
+            DisconnectNamedPipe(h);
+            CloseHandle(h);
+        }
+        let data = match data {
+            Ok(d) => d,
+            Err(e) => {
+                log_error!("Druckauftrag konnte nicht gelesen werden: {e:#}");
+                return;
+            }
+        };
+        if data.is_empty() {
+            // Windows hat die Verbindung ohne Daten beendet (kommt unter hoher Last vor):
+            // Auftrag neu starten, damit er nicht verloren geht
+            if let (Some(printer), Some(job)) = (printer, job) {
+                let n = {
+                    let mut r = self.restarts.lock().unwrap_or_else(|e| e.into_inner());
+                    let n = r.entry((id, job.id)).or_insert(0);
+                    *n += 1;
+                    *n
+                };
+                if n <= MAX_RESTARTS {
+                    log_warn!("Leere Übertragung von „{}“ ({}), starte Auftrag neu ({n}/{MAX_RESTARTS}).", job.document, printer);
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_secs(2));
+                        if !spooler::restart_job(&printer, job.id) {
+                            log_error!("Auftrag „{}“ konnte nicht neu gestartet werden.", job.document);
+                        }
+                    });
+                } else {
+                    log_error!("Auftrag „{}“ ({printer}) kam auch nach {MAX_RESTARTS} Versuchen leer an.", job.document);
+                }
+            } else {
+                log_warn!("Leerer Druckauftrag ohne zugehörigen Auftrag ignoriert.");
+            }
+            return;
+        }
+        let _ = self.job_tx.send((id, data, job.map(|j| j.document)));
     }
 }
 

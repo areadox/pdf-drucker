@@ -160,6 +160,8 @@ jobs:
           for ($i = 0; $i -lt 40 -and -not (Test-Path $druckOut); $i++) { Start-Sleep 1 }
           Start-Sleep 2
           foreach ($d in @($ziel1, $ziel2, $ziel3)) { "${d}:"; Files $d | ForEach-Object { "  $($_.Name)" } }
+          "Warteschlangen:"; Our-Printers | ForEach-Object { Get-PrintJob -PrinterName $_.Name } | Format-Table PrinterName, Id, DocumentName, JobStatus
+          Get-Content $log | Select-String 'WARN|ERROR' | ForEach-Object { "  | $_" }
           Check-Names $f1 $n1
           Check-Names $f2 $n2
           Check-Names $f3 $n3

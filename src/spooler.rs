@@ -8,13 +8,14 @@ use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::time::Duration;
 use windows_sys::Win32::Graphics::Printing::{
-    ClosePrinter, EnumJobsW, EnumPrintersW, GetDefaultPrinterW, GetPrinterW, OpenPrinterW,
+    ClosePrinter, EnumJobsW, EnumPrintersW, GetDefaultPrinterW, GetPrinterW, OpenPrinterW, SetJobW,
     JOB_INFO_1W, PRINTER_INFO_2W, PRINTER_INFO_4W,
 };
 
 const JOB_STATUS_PRINTING: u32 = 0x0000_0010;
 const JOB_STATUS_PRINTED: u32 = 0x0000_0080;
 const JOB_STATUS_COMPLETE: u32 = 0x0000_1000;
+const JOB_CONTROL_RESTART: u32 = 4;
 const PRINTER_ENUM_LOCAL: u32 = 0x0000_0002;
 const PRINTER_ENUM_CONNECTIONS: u32 = 0x0000_0004;
 
@@ -81,6 +82,11 @@ impl Printer {
             .collect()
     }
 
+    /// Auftrag neu starten (Windows überträgt ihn dann noch einmal).
+    pub fn restart_job(&self, id: u32) -> bool {
+        unsafe { SetJobW(self.0, id, 0, null(), JOB_CONTROL_RESTART) != 0 }
+    }
+
     /// Anschluss (Port) des Druckers.
     pub fn port_name(&self) -> Option<String> {
         let h = self.0;
@@ -137,21 +143,26 @@ pub fn default_printer() -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..end]))
 }
 
-/// Dokumentname des Auftrags, den Windows gerade an den Anschluss übergibt.
-pub fn current_document_name(printer: &str) -> Option<String> {
+/// Der Auftrag, den Windows gerade an den Anschluss übergibt.
+pub fn current_job(printer: &str) -> Option<Job> {
     let p = Printer::open(printer)?;
     for attempt in 0..10 {
         let jobs = p.jobs();
         if let Some(j) = jobs.iter().filter(|j| j.status & JOB_STATUS_PRINTING != 0).min_by_key(|j| j.id) {
-            return Some(j.document.clone());
+            return Some(j.clone());
         }
         // Status noch nicht aktualisiert: ältester offener Auftrag ist der, der gerade läuft
         if attempt >= 3 {
             if let Some(j) = jobs.iter().filter(|j| !j.finished()).min_by_key(|j| j.id) {
-                return Some(j.document.clone());
+                return Some(j.clone());
             }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     None
+}
+
+/// Auftrag `id` auf `printer` neu starten.
+pub fn restart_job(printer: &str, id: u32) -> bool {
+    Printer::open(printer).is_some_and(|p| p.restart_job(id))
 }
