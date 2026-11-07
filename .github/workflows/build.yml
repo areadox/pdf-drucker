@@ -63,7 +63,7 @@ jobs:
           Copy-Item pdfium\LICENSE dist\PDF-Ablage\pdfium-LICENSE.txt -ErrorAction SilentlyContinue
           Get-ChildItem dist\PDF-Ablage | Format-Table Name, Length
 
-      - name: End-to-End-Test (Drucker einrichten, Dokumentname, Ausdruck, Entfernen)
+      - name: End-to-End-Test (mehrere Drucker, Dokumentnamen, Ausdruck, Umbenennen, Entfernen)
         shell: pwsh
         env:
           PDF_ABLAGE_NO_GUI: "1"
@@ -77,12 +77,40 @@ jobs:
             Get-Content "$tmp\out.txt", "$tmp\err.txt" -ErrorAction SilentlyContinue | ForEach-Object { "  | $_" }
             if ($p.ExitCode -ne 0) { throw "PDF-Ablage $($a -join ' ') -> Exit $($p.ExitCode)" }
           }
+          function Files($dir) { @(Get-ChildItem $dir -Filter '*.pdf' -ErrorAction SilentlyContinue) }
+          function Wait-Files($dir, [int]$count, [int]$seconds) {
+            for ($i = 0; $i -lt $seconds -and (Files $dir).Count -lt $count; $i++) { Start-Sleep 1 }
+            Files $dir
+          }
+          function Check-Names($files, $namen) {
+            foreach ($n in $namen) {
+              $hits = @($files | Where-Object { $_.Name -like "*_$n.pdf" })
+              if ($hits.Count -ne 1) { throw "$n kam $($hits.Count)-mal an (erwartet: 1)" }
+              $kopf = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($hits[0].FullName)[0..3])
+              if ($kopf -ne '%PDF') { throw "$($hits[0].Name) ist keine gültige PDF" }
+            }
+            if ($files.Count -ne $namen.Count) { throw "Erwartet $($namen.Count) PDFs, gefunden $($files.Count)" }
+          }
+          function Print-All($namen, $drucker) {
+            foreach ($n in $namen) { Run-App @('make-test-pdf', "$tmp\$n.pdf") }
+            foreach ($n in $namen) {
+              Start-Process $exe -ArgumentList @('print', "$tmp\$n.pdf", $drucker) -PassThru -NoNewWindow `
+                -RedirectStandardOutput "$tmp\$n.out" -RedirectStandardError "$tmp\$n.err"
+            }
+          }
           $log = "$env:ProgramData\PDFDrucker\pdf_drucker.log"
+          $cfgFile = "$env:ProgramData\PDFDrucker\config.json"
+          function Edit-Config([scriptblock]$change) {
+            $cfg = Get-Content $cfgFile -Raw | ConvertFrom-Json
+            & $change $cfg
+            $cfg | ConvertTo-Json -Depth 10 | Set-Content $cfgFile -Encoding utf8
+          }
+          function Our-Printers { @(Get-Printer | Where-Object { $_.PortName -like '\\.\pipe\PDFAblage*' }) }
 
           Set-Service Spooler -StartupType Automatic
           Start-Service Spooler
 
-          # Zweiter Drucker als Ziel für den automatischen Ausdruck
+          # Echter Drucker als Ziel für den automatischen Ausdruck
           $druckOut = "$tmp\testdruck.pdf"
           $drv = (Get-PrinterDriver | Where-Object { $_.Name -like '*Print*PDF*' } | Select-Object -First 1).Name
           Add-PrinterPort -Name $druckOut
@@ -91,82 +119,103 @@ jobs:
           "== Selbsttest (pdfium) =="
           Run-App @('selftest')
 
-          "== Drucker einrichten =="
-          $ziel = "$tmp\ziel"
-          Run-App @('install', '--ordner', $ziel)
-          $pr = Get-Printer -Name 'PDF-Ablage'
-          "Anschluss: $($pr.PortName)"
-          if ($pr.PortName -ne '\\.\pipe\PDFAblage') { throw 'Drucker nutzt nicht die Pipe' }
-
-          $cfgFile = "$env:ProgramData\PDFDrucker\config.json"
+          "== Alte Einstellungen (Version 2.1) werden übernommen =="
+          New-Item -ItemType Directory -Force "$env:ProgramData\PDFDrucker" | Out-Null
+          $ziel1 = "$tmp\ziel1"
+          @{ printer_name = 'PDF-Ablage'; target_dir = $ziel1; filename_pattern = '{datum}_{zeit}_{titel}';
+             print_after_save = $true; print_printer = 'Testdrucker'; notify = $true } |
+            ConvertTo-Json | Set-Content $cfgFile -Encoding utf8
+          Run-App @('install')
           $cfg = Get-Content $cfgFile -Raw | ConvertFrom-Json
-          $cfg.print_after_save = $true
-          $cfg.print_printer = 'Testdrucker'
-          $cfg | ConvertTo-Json | Set-Content $cfgFile -Encoding utf8
-
-          function Wait-Files([int]$count, [int]$seconds) {
-            for ($i = 0; $i -lt $seconds; $i++) {
-              $f = @(Get-ChildItem $ziel -Filter '*.pdf' -ErrorAction SilentlyContinue)
-              if ($f.Count -ge $count) { break }
-              Start-Sleep 1
-            }
-            @(Get-ChildItem $ziel -Filter '*.pdf' -ErrorAction SilentlyContinue)
+          if ($cfg.printers.Count -ne 1 -or $cfg.printers[0].target_dir -ne $ziel1 -or -not $cfg.printers[0].print_after_save) {
+            throw "Alte Einstellungen nicht übernommen: $($cfg | ConvertTo-Json -Depth 5)"
           }
+          "Übernommen: $($cfg.printers[0].name) -> $($cfg.printers[0].target_dir)"
 
-          "== 5 Dokumente gleichzeitig drucken =="
-          $namen = 1..5 | ForEach-Object { "Schnelltest$_" }
-          foreach ($n in $namen) { Run-App @('make-test-pdf', "$tmp\$n.pdf") }
+          "== Zweiten und dritten Drucker hinzufügen =="
+          $ziel2 = "$tmp\ziel2"; $ziel3 = "$tmp\ziel3"
+          Edit-Config {
+            param($c)
+            $c.printers += [pscustomobject]@{ id = 2; name = 'PDF-Ablage Rechnungen'; target_dir = $ziel2;
+              filename_pattern = 'Rechnung_{titel}'; open_after_save = $false; print_after_save = $false; print_printer = '' }
+            $c.printers += [pscustomobject]@{ id = 3; name = 'PDF-Ablage Belege'; target_dir = $ziel3;
+              filename_pattern = '{datum}_{titel}'; open_after_save = $false; print_after_save = $false; print_printer = '' }
+          }
+          Run-App @('sync')
+          Our-Printers | Format-Table Name, PortName
+          if ((Get-Printer -Name 'PDF-Ablage Rechnungen').PortName -ne '\\.\pipe\PDFAblage-2') { throw 'Drucker 2 falsch eingerichtet' }
+          if ((Get-Printer -Name 'PDF-Ablage Belege').PortName -ne '\\.\pipe\PDFAblage-3') { throw 'Drucker 3 falsch eingerichtet' }
+
+          "== Auf allen drei Druckern gleichzeitig drucken =="
           $w = Start-Process $exe -ArgumentList 'run' -PassThru -NoNewWindow
           Start-Sleep 2
-          $jobs = foreach ($n in $namen) {
-            Start-Process $exe -ArgumentList @('print', "$tmp\$n.pdf", 'PDF-Ablage') -PassThru -NoNewWindow `
-              -RedirectStandardOutput "$tmp\$n.out" -RedirectStandardError "$tmp\$n.err"
-          }
-          $jobs | Wait-Process -Timeout 60
-          $files = Wait-Files 5 60
+          $n1 = 1..5 | ForEach-Object { "Schnelltest$_" }
+          $n2 = 1..3 | ForEach-Object { "Rechnung$_" }
+          $n3 = 1..2 | ForEach-Object { "Beleg$_" }
+          Print-All $n1 'PDF-Ablage'
+          Print-All $n2 'PDF-Ablage Rechnungen'
+          Print-All $n3 'PDF-Ablage Belege'
+          $f1 = Wait-Files $ziel1 5 90; $f2 = Wait-Files $ziel2 3 60; $f3 = Wait-Files $ziel3 2 60
           for ($i = 0; $i -lt 40 -and -not (Test-Path $druckOut); $i++) { Start-Sleep 1 }
           Start-Sleep 2
-          "Im Zielordner:"; $files | ForEach-Object { "  $($_.Name)  ($($_.Length) Bytes)" }
-          foreach ($n in $namen) {
-            $hits = @($files | Where-Object { $_.Name -like "*_$n.pdf" -or $_.Name -like "*_${n}_*.pdf" })
-            if ($hits.Count -ne 1) { throw "$n kam $($hits.Count)-mal an (erwartet: 1)" }
-            $kopf = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($hits[0].FullName)[0..3])
-            if ($kopf -ne '%PDF') { throw "$($hits[0].Name) ist keine gültige PDF" }
-          }
-          if ($files.Count -ne 5) { throw "Erwartet 5 PDFs, gefunden $($files.Count)" }
-          Write-Output "::notice title=Schnelldruck::5 von 5 Dokumenten mit richtigem Namen angekommen"
+          foreach ($d in @($ziel1, $ziel2, $ziel3)) { "${d}:"; Files $d | ForEach-Object { "  $($_.Name)" } }
+          Check-Names $f1 $n1
+          Check-Names $f2 $n2
+          Check-Names $f3 $n3
+          if (@($f2 | Where-Object Name -notlike 'Rechnung_*').Count -gt 0) { throw 'Dateiname-Muster von Drucker 2 nicht angewendet' }
+          Write-Output "::notice title=Mehrere Drucker::10 von 10 Dokumenten auf 3 Druckern im richtigen Ordner mit richtigem Namen"
           if (-not (Test-Path $druckOut)) { throw 'Automatischer Ausdruck ist nicht angekommen' }
-          Write-Output "::notice title=Ausdruck::$((Get-Item $druckOut).Length) Bytes an 'Testdrucker'"
+
+          "== Drucker 3 umbenennen =="
+          Edit-Config { param($c) ($c.printers | Where-Object id -eq 3).name = 'PDF-Ablage Quittungen' }
+          Run-App @('sync')
+          if (Get-Printer -Name 'PDF-Ablage Belege' -ErrorAction SilentlyContinue) { throw 'Alter Name existiert noch' }
+          if ((Get-Printer -Name 'PDF-Ablage Quittungen').PortName -ne '\\.\pipe\PDFAblage-3') { throw 'Umbenennen fehlgeschlagen' }
+          Stop-Process $w -Force -ErrorAction SilentlyContinue
+          $w = Start-Process $exe -ArgumentList 'run' -PassThru -NoNewWindow
+          Start-Sleep 2
+          Print-All @('Quittung1') 'PDF-Ablage Quittungen'
+          $f3 = Wait-Files $ziel3 3 60
+          if (@($f3 | Where-Object Name -like '*_Quittung1.pdf').Count -ne 1) { throw 'Druck nach Umbenennen nicht angekommen' }
+          "Umbenannt und gedruckt: ok"
+
+          "== Drucker 2 entfernen =="
+          Edit-Config { param($c) $c.printers = @($c.printers | Where-Object id -ne 2) }
+          Run-App @('sync')
+          if (Get-Printer -Name 'PDF-Ablage Rechnungen' -ErrorAction SilentlyContinue) { throw 'Drucker 2 wurde nicht entfernt' }
+          Our-Printers | Format-Table Name, PortName
 
           "== Drucken, während die App nicht läuft =="
           Stop-Process $w -Force -ErrorAction SilentlyContinue
           Start-Sleep 1
           Run-App @('make-test-pdf', "$tmp\Offlinetest.pdf")
           Run-App @('print', "$tmp\Offlinetest.pdf", 'PDF-Ablage')
-          Start-Sleep 5
-          "Warteschlange ohne App:"; Get-PrintJob -PrinterName 'PDF-Ablage' | Format-Table Id, DocumentName, JobStatus
+          Start-Sleep 3
           $w = Start-Process $exe -ArgumentList 'run' -PassThru -NoNewWindow
-          $files = Wait-Files 6 90
-          if (@($files | Where-Object Name -like '*Offlinetest*').Count -eq 1) {
-            Write-Output "::notice title=Ohne laufende App::Auftrag wartete in der Warteschlange und kam nach dem Start an"
-          } else {
-            Write-Output "::warning title=Ohne laufende App::Auftrag kam nach dem Start nicht innerhalb von 90 s an"
-          }
+          $f1 = Wait-Files $ziel1 6 90
+          if (@($f1 | Where-Object Name -like '*Offlinetest*').Count -ne 1) { throw 'Auftrag ohne laufende App ging verloren' }
+          Write-Output "::notice title=Ohne laufende App::Auftrag wartete in der Warteschlange und kam nach dem Start an"
           Stop-Process $w -Force -ErrorAction SilentlyContinue
-          "Warteschlange danach:"; Get-PrintJob -PrinterName 'PDF-Ablage' | Format-Table Id, DocumentName, JobStatus
           "== Protokoll =="
           Get-Content $log -ErrorAction SilentlyContinue | ForEach-Object { "  | $_" }
 
-          "== Tray-App starten (darf nicht abstürzen) =="
+          "== Tray-App und Einstellungsfenster starten (dürfen nicht abstürzen) =="
           $t = Start-Process $exe -PassThru
-          Start-Sleep 5
+          Start-Sleep 4
           if ($t.HasExited) { throw "Tray-App hat sich beendet (Exit $($t.ExitCode))" }
+          Start-Process $exe -ArgumentList 'einstellungen' -Wait
+          Start-Sleep 3
+          if ($t.HasExited) { throw "Tray-App ist beim Öffnen der Einstellungen abgestürzt (Exit $($t.ExitCode))" }
           Stop-Process $t -Force
-          "Tray-App lief 5 Sekunden stabil."
+          $s = Start-Process $exe -ArgumentList 'einstellungen' -PassThru
+          Start-Sleep 4
+          if ($s.HasExited) { throw "Einstellungsfenster (eigenständig) hat sich beendet (Exit $($s.ExitCode))" }
+          Stop-Process $s -Force
+          "Tray-App und Einstellungsfenster liefen stabil."
 
-          "== Drucker entfernen =="
+          "== Alle Drucker entfernen =="
           Run-App @('uninstall')
-          if (Get-Printer -Name 'PDF-Ablage' -ErrorAction SilentlyContinue) { throw 'Drucker wurde nicht entfernt' }
+          if ((Our-Printers).Count -gt 0) { throw 'Drucker wurden nicht entfernt' }
 
       - name: Inno Setup bereitstellen
         shell: pwsh

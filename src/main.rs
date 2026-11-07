@@ -1,8 +1,8 @@
 //! PDF-Ablage – virtueller PDF-Drucker für Windows.
 //!
-//! Alles, was auf den Drucker "PDF-Ablage" gedruckt wird, landet ohne Nachfrage als PDF in einem
-//! festen Ordner – benannt nach Datum, Uhrzeit und Dokumentname. Optional wird die PDF zusätzlich
-//! auf einem echten Drucker ausgegeben.
+//! Bis zu fünf PDF-Drucker: Was auf einen davon gedruckt wird, landet ohne Nachfrage als PDF in
+//! dessen Zielordner – benannt nach Datum, Uhrzeit und Dokumentname. Optional wird die PDF
+//! zusätzlich auf einem echten Drucker ausgegeben.
 
 #![windows_subsystem = "windows"]
 
@@ -12,6 +12,7 @@ mod config;
 mod install;
 mod logic;
 mod pdf;
+mod settings;
 mod spooler;
 mod tray;
 mod ui;
@@ -25,9 +26,11 @@ use std::path::Path;
 const HILFE: &str = "PDF-Ablage – virtueller PDF-Drucker
 
 Befehle:
-  PDF-Ablage.exe                          Tray-App starten (Standard)
-  PDF-Ablage.exe install [--name NAME] [--ordner PFAD]   Drucker einrichten (Administrator)
-  PDF-Ablage.exe uninstall                Drucker entfernen (Administrator)
+  PDF-Ablage.exe                          Tray-App starten (läuft sie schon: Einstellungen öffnen)
+  PDF-Ablage.exe einstellungen            Einstellungen öffnen
+  PDF-Ablage.exe sync                     alle Drucker gemäß Einstellungen einrichten (Administrator)
+  PDF-Ablage.exe install [--name NAME] [--ordner PFAD]   ersten Drucker einrichten (Administrator)
+  PDF-Ablage.exe uninstall                alle PDF-Ablage-Drucker entfernen (Administrator)
   PDF-Ablage.exe run                      Überwachung ohne Tray
   PDF-Ablage.exe autostart [--aus]        beim Anmelden starten / nicht mehr starten
   PDF-Ablage.exe config                   Einstellungen anzeigen
@@ -63,6 +66,13 @@ fn run(cmd: &str, args: &[String]) -> Result<i32> {
         "run" => watch::run_console(),
         "install" => install::cmd_install(option(args, "--name"), option(args, "--ordner")),
         "uninstall" => install::cmd_uninstall(),
+        "sync" => install::cmd_sync(),
+        "einstellungen" | "settings" => {
+            if !tray::signal_running_instance() {
+                settings::run_standalone();
+            }
+            Ok(0)
+        }
         "autostart" => {
             let off = args.iter().any(|a| a == "--aus");
             install::set_autostart(!off)?;
@@ -90,7 +100,10 @@ fn run(cmd: &str, args: &[String]) -> Result<i32> {
             let file = pos.first().context("Bitte die PDF-Datei angeben.")?;
             let printer = match pos.get(1) {
                 Some(p) => p.clone(),
-                None => watch::resolve_print_printer(&config::load())?,
+                None => {
+                    let cfg = config::load();
+                    watch::resolve_print_printer(&cfg, &cfg.first())?
+                }
             };
             let path = Path::new(file);
             let doc_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();

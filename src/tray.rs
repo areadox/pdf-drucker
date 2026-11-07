@@ -2,8 +2,8 @@
 
 use crate::config::{self, Config, APP_NAME, APP_VERSION};
 use crate::util::{copy_into, wide};
-use crate::watch::{self, Event, Events};
-use crate::{install, spooler, ui, update};
+use crate::watch::{Event, Events, Receiver};
+use crate::{install, settings, ui, update};
 use anyhow::{bail, Result};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -18,7 +18,7 @@ use windows_sys::Win32::UI::Shell::{
     NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetCursorPos,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, FindWindowW, GetCursorPos,
     GetMessageW, GetSystemMetrics, LoadIconW, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW,
     RegisterWindowMessageW, SetForegroundWindow, SetMenuDefaultItem, TrackPopupMenu, TranslateMessage, HICON, HMENU,
     IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
@@ -29,12 +29,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_NOTICE: u32 = WM_APP + 2;
 const WM_APP_QUIT: u32 = WM_APP + 3;
+/// Einstellungen öffnen (auch von einem zweiten Programmstart aus gesendet)
+const WM_OPEN_SETTINGS: u32 = WM_APP + 4;
+const CLASS: &str = "PDFAblageTrayWnd";
 
 // Menü-Befehle
-const ID_OPEN: usize = 10;
-const ID_CHANGE: usize = 11;
-const ID_OPEN_AFTER: usize = 20;
-const ID_PRINT: usize = 21;
+const ID_SETTINGS: usize = 10;
+const ID_OPEN_FIRST: usize = 100; // 100.. = Zielordner von Drucker 1..5
 const ID_NOTIFY: usize = 22;
 const ID_AUTOSTART: usize = 23;
 const ID_INSTALL: usize = 30;
@@ -43,12 +44,12 @@ const ID_LOG: usize = 32;
 const ID_UPDATE: usize = 40;
 const ID_AUTOUPDATE: usize = 41;
 const ID_QUIT: usize = 99;
-const ID_PRINTER_DEFAULT: usize = 1000; // 1001.. = Drucker aus der Liste
 
 struct State {
     cfg: Arc<Mutex<Config>>,
     icon: usize,
     taskbar_created: u32,
+    receiver: OnceLock<Arc<Receiver>>,
 }
 
 static STATE: OnceLock<State> = OnceLock::new();
@@ -182,35 +183,27 @@ unsafe fn separator(menu: HMENU) {
 
 fn show_menu(hwnd: HWND) {
     let c = cfg();
-    let printers = spooler::list_printers(Some(&c.printer_name));
-    let default = spooler::default_printer().unwrap_or_else(|| "–".into());
     let cmd = unsafe {
         let menu = CreatePopupMenu();
         item(menu, MF_STRING | MF_GRAYED, 1, &format!("{APP_NAME} {APP_VERSION}"));
         separator(menu);
-        item(menu, MF_STRING, ID_OPEN, "Zielordner öffnen");
-        item(menu, MF_STRING, ID_CHANGE, "Zielordner ändern …");
-        SetMenuDefaultItem(menu, ID_OPEN as u32, 0);
+        item(menu, MF_STRING, ID_SETTINGS, "Einstellungen …");
+        if c.printers.len() <= 1 {
+            item(menu, MF_STRING, ID_OPEN_FIRST, "Zielordner öffnen");
+        } else {
+            let sub = CreatePopupMenu();
+            for (i, p) in c.printers.iter().enumerate() {
+                item(sub, MF_STRING, ID_OPEN_FIRST + i, &p.name);
+            }
+            item(menu, MF_STRING | MF_POPUP, sub as usize, "Zielordner öffnen");
+        }
+        SetMenuDefaultItem(menu, ID_SETTINGS as u32, 0);
         separator(menu);
-        check(menu, ID_OPEN_AFTER, "PDF nach dem Speichern öffnen", c.open_after_save);
-        check(menu, ID_PRINT, "PDF zusätzlich ausdrucken", c.print_after_save);
-
-        let sub = CreatePopupMenu();
-        check(sub, ID_PRINTER_DEFAULT, &format!("Windows-Standarddrucker ({default})"), c.print_printer.is_empty());
-        separator(sub);
-        for (i, p) in printers.iter().enumerate() {
-            check(sub, ID_PRINTER_DEFAULT + 1 + i, p, c.print_printer == *p);
-        }
-        if !c.print_printer.is_empty() && !printers.contains(&c.print_printer) {
-            item(sub, MF_STRING | MF_GRAYED, 2, &format!("{} (nicht gefunden)", c.print_printer));
-        }
-        item(menu, MF_STRING | MF_POPUP, sub as usize, "Ausdrucken auf");
-
         check(menu, ID_NOTIFY, "Benachrichtigung anzeigen", c.notify);
         check(menu, ID_AUTOSTART, "Mit Windows starten", install::autostart_enabled());
         separator(menu);
-        item(menu, MF_STRING, ID_INSTALL, "Drucker einrichten …");
-        item(menu, MF_STRING, ID_UNINSTALL, "Drucker entfernen …");
+        item(menu, MF_STRING, ID_INSTALL, "Drucker in Windows einrichten …");
+        item(menu, MF_STRING, ID_UNINSTALL, "Alle Drucker entfernen …");
         item(menu, MF_STRING, ID_LOG, "Protokoll öffnen");
         separator(menu);
         item(menu, MF_STRING, ID_UPDATE, "Nach Updates suchen …");
@@ -227,45 +220,32 @@ fn show_menu(hwnd: HWND) {
         cmd
     };
     if cmd > 0 {
-        handle_command(cmd as usize, &printers);
+        handle_command(cmd as usize);
     }
 }
 
-fn open_target() {
-    let dir = cfg().target_dir;
-    let _ = std::fs::create_dir_all(&dir);
-    ui::open(&dir);
+fn open_target(index: usize) {
+    let c = cfg();
+    let Some(p) = c.printers.get(index) else { return };
+    let _ = std::fs::create_dir_all(&p.target_dir);
+    ui::open(&p.target_dir);
 }
 
-fn change_folder() {
-    let current = cfg().target_dir;
-    let picked = rfd::FileDialog::new()
-        .set_title("Zielordner für PDFs wählen")
-        .set_directory(&current)
-        .pick_folder();
-    if let Some(folder) = picked {
-        let s = folder.to_string_lossy().into_owned();
-        update_cfg(|c| c.target_dir = s.clone());
-        log_info!("Neuer Zielordner: {s}");
-        post_notice("Neuer Zielordner", &s, false);
-    }
-}
-
-fn handle_command(id: usize, printers: &[String]) {
-    match id {
-        ID_OPEN => open_target(),
-        ID_CHANGE => change_folder(),
-        ID_OPEN_AFTER => update_cfg(|c| c.open_after_save = !c.open_after_save),
-        ID_PRINT => {
-            let c = cfg();
-            if !c.print_after_save {
-                if let Err(e) = watch::resolve_print_printer(&c) {
-                    ui::message(&format!("{e:#}"), true);
-                    return;
-                }
-            }
-            update_cfg(|c| c.print_after_save = !c.print_after_save);
+fn open_settings() {
+    let st = state();
+    let receiver = st.receiver.get().cloned();
+    let hook: settings::Hook = Arc::new(move || {
+        if let Some(r) = &receiver {
+            r.ensure_servers();
         }
+    });
+    settings::open(st.cfg.clone(), Some(hook), false);
+}
+
+fn handle_command(id: usize) {
+    match id {
+        ID_SETTINGS => open_settings(),
+        n if (ID_OPEN_FIRST..ID_OPEN_FIRST + config::MAX_PRINTERS).contains(&n) => open_target(n - ID_OPEN_FIRST),
         ID_NOTIFY => update_cfg(|c| c.notify = !c.notify),
         ID_AUTOSTART => {
             if let Err(e) = install::set_autostart(!install::autostart_enabled()) {
@@ -273,10 +253,16 @@ fn handle_command(id: usize, printers: &[String]) {
             }
         }
         ID_INSTALL => {
-            ui::run_elevated("install");
+            ui::run_elevated("sync");
         }
         ID_UNINSTALL => {
-            ui::run_elevated("uninstall");
+            if ui::ask(
+                "Alle PDF-Ablage-Drucker aus Windows entfernen?\n\nDie Einstellungen und gespeicherten PDFs bleiben erhalten; \
+                 über „Drucker in Windows einrichten …“ lassen sich die Drucker wieder anlegen.",
+                APP_NAME,
+            ) {
+                ui::run_elevated("uninstall");
+            }
         }
         ID_LOG => ui::open(&config::log_file()),
         ID_UPDATE => {
@@ -284,11 +270,6 @@ fn handle_command(id: usize, printers: &[String]) {
         }
         ID_AUTOUPDATE => update_cfg(|c| c.auto_update_check = !c.auto_update_check),
         ID_QUIT => quit(),
-        ID_PRINTER_DEFAULT => update_cfg(|c| c.print_printer.clear()),
-        n if n > ID_PRINTER_DEFAULT && n <= ID_PRINTER_DEFAULT + printers.len() => {
-            let name = printers[n - ID_PRINTER_DEFAULT - 1].clone();
-            update_cfg(|c| c.print_printer = name);
-        }
         _ => {}
     }
 }
@@ -360,7 +341,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TRAY => {
             match (lp as u32) & 0xFFFF {
                 WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd),
-                WM_LBUTTONDBLCLK => open_target(),
+                WM_LBUTTONDBLCLK => open_target(0),
                 _ => {}
             }
             0
@@ -368,6 +349,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_NOTICE => {
             let notice = Box::from_raw(lp as *mut Notice);
             balloon(hwnd, &notice);
+            0
+        }
+        WM_OPEN_SETTINGS => {
+            open_settings();
             0
         }
         WM_APP_QUIT => {
@@ -382,7 +367,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 fn create_window() -> Result<HWND> {
     unsafe {
         let hinst = GetModuleHandleW(null());
-        let class = wide("PDFAblageTrayWnd");
+        let class = wide(CLASS);
         let mut wc: WNDCLASSW = std::mem::zeroed();
         wc.lpfnWndProc = Some(wndproc);
         wc.hInstance = hinst;
@@ -430,32 +415,35 @@ fn apply_autostart_default(cfg: &Arc<Mutex<Config>>) {
 }
 
 fn check_printer_setup(c: &Config) {
-    if !spooler::printer_exists(&c.printer_name) {
-        let text = format!(
-            "Der Drucker '{}' ist noch nicht eingerichtet.\n\nJetzt einrichten? (Administratorrechte nötig)\n\n\
-             Zielordner:\n{}",
-            c.printer_name, c.target_dir
-        );
-        if ui::ask(&text, APP_NAME) {
-            ui::run_elevated("install");
-        }
-    } else if !spooler::port_name(&c.printer_name).is_some_and(|p| p.eq_ignore_ascii_case(config::PIPE_NAME)) {
-        let text = format!(
-            "Der Drucker '{}' muss einmalig aktualisiert werden (Administratorrechte nötig).\n\n\
-             Danach bekommen die PDFs zuverlässig den Namen des Dokuments, und mehrere schnell \
-             hintereinander gedruckte Dokumente gehen nicht mehr verloren.\n\nJetzt aktualisieren?",
-            c.printer_name
-        );
-        if ui::ask(&text, APP_NAME) {
-            ui::run_elevated("install");
-        }
+    let problems = install::windows_problems(c);
+    if problems.is_empty() {
+        return;
     }
+    let text = format!(
+        "{}\n\nJetzt in Windows einrichten? (Administratorrechte nötig)",
+        problems.join("\n")
+    );
+    if ui::ask(&text, APP_NAME) {
+        ui::run_elevated("sync");
+    }
+}
+
+/// Läuft die Tray-App schon? Dann dort die Einstellungen öffnen.
+pub fn signal_running_instance() -> bool {
+    let hwnd = unsafe { FindWindowW(wide(CLASS).as_ptr(), null()) };
+    if hwnd.is_null() {
+        return false;
+    }
+    unsafe { PostMessageW(hwnd, WM_OPEN_SETTINGS, 0, 0) != 0 }
 }
 
 pub fn run(after_update: bool) -> Result<i32> {
     let wait = if after_update { Duration::from_secs(20) } else { Duration::ZERO };
     if !single_instance(wait) {
-        ui::message(&format!("{APP_NAME} läuft bereits (Symbol im Infobereich der Taskleiste)."), false);
+        // Zweiter Start (z. B. über das Startmenü): Einstellungen der laufenden App öffnen
+        if !signal_running_instance() {
+            ui::message(&format!("{APP_NAME} läuft bereits (Symbol im Infobereich der Taskleiste)."), false);
+        }
         return Ok(0);
     }
     log_info!("{APP_NAME} {APP_VERSION} gestartet");
@@ -467,8 +455,8 @@ pub fn run(after_update: bool) -> Result<i32> {
         cfg: cfg.clone(),
         icon: load_icon() as usize,
         taskbar_created: unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
+        receiver: OnceLock::new(),
     });
-    check_printer_setup(&cfg.lock().map(|c| c.clone()).unwrap_or_default());
 
     let hwnd = create_window()?;
     HWND_VAL.store(hwnd as usize, Ordering::Relaxed);
@@ -492,12 +480,8 @@ pub fn run(after_update: bool) -> Result<i32> {
             }
         })
     };
-    let print_tx = watch::start_print_worker(cfg.clone(), events.clone());
-    let stop = Arc::new(AtomicBool::new(false));
-    {
-        let (cfg, stop) = (cfg.clone(), stop.clone());
-        thread::spawn(move || watch::watch(cfg, stop, events, Some(print_tx)));
-    }
+    let _ = state().receiver.set(Receiver::start(cfg.clone(), events));
+    check_printer_setup(&cfg.lock().map(|c| c.clone()).unwrap_or_default());
     {
         let cfg = cfg.clone();
         thread::spawn(move || {
@@ -513,11 +497,13 @@ pub fn run(after_update: bool) -> Result<i32> {
     unsafe {
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            if settings::is_dialog_message(&msg) {
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
-    stop.store(true, Ordering::Relaxed);
     log_info!("Beendet.");
     Ok(0)
 }

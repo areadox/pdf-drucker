@@ -1,22 +1,22 @@
-//! Empfängt die Druckaufträge über die Named Pipe und legt sie als PDF im Zielordner ab.
+//! Empfängt die Druckaufträge über Named Pipes (eine pro Drucker) und legt sie als PDF ab.
 //!
-//! Windows übergibt jeden Druckauftrag einzeln an die Pipe (eine Verbindung pro Auftrag).
-//! Dadurch kann nichts überschrieben werden, auch wenn mehrere Dokumente direkt
-//! hintereinander gedruckt werden.
+//! Windows übergibt jeden Druckauftrag einzeln an die Pipe seines Druckers (eine Verbindung
+//! pro Auftrag). Dadurch kann nichts überschrieben werden, auch wenn mehrere Dokumente direkt
+//! hintereinander oder auf mehreren Druckern gleichzeitig gedruckt werden.
 
-use crate::config::{self, Config, PIPE_NAME};
+use crate::config::{self, Config, PrinterConfig};
 use crate::util::wide;
 use crate::{logic, pdf, spooler, ui};
 use anyhow::{bail, Context, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_BROKEN_PIPE, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, ERROR_BROKEN_PIPE, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, PIPE_ACCESS_INBOUND};
 use windows_sys::Win32::System::Pipes::{
@@ -32,78 +32,112 @@ pub enum Event {
 
 pub type Events = Arc<dyn Fn(Event) + Send + Sync>;
 
-/// Nimmt Druckaufträge entgegen, bis `stop` gesetzt wird (bzw. das Programm endet).
-pub fn watch(cfg: Arc<Mutex<Config>>, stop: Arc<AtomicBool>, events: Events, print_tx: Option<Sender<PathBuf>>) {
-    log_info!(
-        "Empfange Druckaufträge über {PIPE_NAME} -> {}",
-        cfg.lock().map(|c| c.target_dir.clone()).unwrap_or_default()
-    );
-    // Aufträge werden in einem eigenen Thread der Reihe nach abgelegt
-    let (job_tx, job_rx) = mpsc::channel::<(Vec<u8>, Option<String>)>();
-    {
-        let cfg = cfg.clone();
-        thread::spawn(move || {
-            for (data, doc) in job_rx {
-                let c = cfg.lock().map(|c| c.clone()).unwrap_or_default();
-                if let Err(e) = save_job(&c, &data, doc.as_deref(), &events, print_tx.as_ref()) {
-                    log_error!("Druckauftrag konnte nicht gespeichert werden: {e:#}");
+/// Ein empfangener Druckauftrag: Drucker-Nr., Daten, Dokumentname.
+type Job = (u8, Vec<u8>, Option<String>);
+
+/// Nimmt Druckaufträge für alle eingestellten Drucker entgegen.
+pub struct Receiver {
+    cfg: Arc<Mutex<Config>>,
+    job_tx: Sender<Job>,
+    started: Mutex<HashSet<u8>>,
+}
+
+impl Receiver {
+    pub fn start(cfg: Arc<Mutex<Config>>, events: Events) -> Arc<Receiver> {
+        let print_tx = start_print_worker(events.clone());
+        let (job_tx, job_rx) = mpsc::channel::<Job>();
+        {
+            // Aufträge werden der Reihe nach abgelegt
+            let cfg = cfg.clone();
+            thread::spawn(move || {
+                for (id, data, doc) in job_rx {
+                    let c = lock(&cfg);
+                    let p = c.printer(id).cloned().unwrap_or_else(|| c.first());
+                    if let Err(e) = save_job(&c, &p, &data, doc.as_deref(), &events, &print_tx) {
+                        log_error!("Druckauftrag für „{}“ konnte nicht gespeichert werden: {e:#}", p.name);
+                    }
                 }
-            }
-        });
+            });
+        }
+        let r = Arc::new(Receiver { cfg, job_tx, started: Mutex::new(HashSet::new()) });
+        r.ensure_servers();
+        r
     }
 
-    let name = wide(PIPE_NAME);
-    let mut failures = 0u32;
-    while !stop.load(Ordering::Relaxed) {
-        // Neue Pipe-Instanz anlegen, auf den nächsten Auftrag warten
-        let h = unsafe {
-            CreateNamedPipeW(
-                name.as_ptr(),
-                PIPE_ACCESS_INBOUND,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                PIPE_UNLIMITED_INSTANCES,
-                0,
-                1 << 20,
-                0,
-                null(),
-            )
-        };
-        if h == INVALID_HANDLE_VALUE {
-            failures += 1;
-            if failures == 1 || failures % 30 == 0 {
-                log_error!("Pipe {PIPE_NAME} konnte nicht angelegt werden (Fehler {}).", unsafe { GetLastError() });
+    /// Startet für jeden eingestellten Drucker einen Pipe-Empfang (bereits laufende bleiben).
+    pub fn ensure_servers(self: &Arc<Self>) {
+        let printers = lock(&self.cfg).printers;
+        let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
+        for p in printers {
+            if started.insert(p.id) {
+                log_info!("Empfange Druckaufträge für „{}“ über {} -> {}", p.name, p.pipe(), p.target_dir);
+                let me = self.clone();
+                thread::spawn(move || me.serve(p.id));
             }
-            thread::sleep(Duration::from_secs(2));
-            continue;
         }
-        failures = 0;
-        let connected = unsafe { ConnectNamedPipe(h, null_mut()) } != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
-        if !connected {
-            unsafe { CloseHandle(h) };
-            continue;
-        }
-        // Genau jetzt läuft der Auftrag, der in die Pipe schreibt -> Dokumentname passt sicher
-        let printer = cfg.lock().map(|c| c.printer_name.clone()).unwrap_or_default();
-        let doc = spooler::current_document_name(&printer);
-        // Lesen in eigenem Thread, damit sofort die nächste Pipe-Instanz bereitsteht
-        let (h, job_tx) = (h as usize, job_tx.clone());
-        thread::spawn(move || {
-            let data = read_all(h as _);
-            unsafe {
-                DisconnectNamedPipe(h as _);
-                CloseHandle(h as _);
-            }
-            match data {
-                Ok(data) => {
-                    let _ = job_tx.send((data, doc));
+    }
+
+    fn serve(&self, id: u8) {
+        let pipe = config::pipe_name(id);
+        let name = wide(&pipe);
+        let mut failures = 0u32;
+        loop {
+            // Neue Pipe-Instanz anlegen, auf den nächsten Auftrag warten
+            let h = unsafe {
+                CreateNamedPipeW(
+                    name.as_ptr(),
+                    PIPE_ACCESS_INBOUND,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    PIPE_UNLIMITED_INSTANCES,
+                    0,
+                    1 << 20,
+                    0,
+                    null(),
+                )
+            };
+            if h == INVALID_HANDLE_VALUE {
+                failures += 1;
+                if failures == 1 || failures % 30 == 0 {
+                    log_error!("Pipe {pipe} konnte nicht angelegt werden (Fehler {}).", unsafe { GetLastError() });
                 }
-                Err(e) => log_error!("Druckauftrag konnte nicht gelesen werden: {e:#}"),
+                thread::sleep(Duration::from_secs(2));
+                continue;
             }
-        });
+            failures = 0;
+            let connected =
+                unsafe { ConnectNamedPipe(h, null_mut()) } != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
+            if !connected {
+                unsafe { CloseHandle(h) };
+                continue;
+            }
+            // Genau jetzt läuft der Auftrag, der in die Pipe schreibt -> Dokumentname passt sicher
+            let printer = lock(&self.cfg).printer(id).map(|p| p.name.clone());
+            let doc = printer.and_then(|n| spooler::current_document_name(&n));
+            // Lesen in eigenem Thread, damit sofort die nächste Pipe-Instanz bereitsteht
+            let (h, job_tx) = (h as usize, self.job_tx.clone());
+            thread::spawn(move || {
+                let h = h as HANDLE;
+                let data = read_all(h);
+                unsafe {
+                    DisconnectNamedPipe(h);
+                    CloseHandle(h);
+                }
+                match data {
+                    Ok(data) => {
+                        let _ = job_tx.send((id, data, doc));
+                    }
+                    Err(e) => log_error!("Druckauftrag konnte nicht gelesen werden: {e:#}"),
+                }
+            });
+        }
     }
 }
 
-fn read_all(h: windows_sys::Win32::Foundation::HANDLE) -> Result<Vec<u8>> {
+fn lock(cfg: &Arc<Mutex<Config>>) -> Config {
+    cfg.lock().map(|c| c.clone()).unwrap_or_default()
+}
+
+fn read_all(h: HANDLE) -> Result<Vec<u8>> {
     let mut data = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -123,10 +157,11 @@ fn read_all(h: windows_sys::Win32::Foundation::HANDLE) -> Result<Vec<u8>> {
 
 fn save_job(
     c: &Config,
+    p: &PrinterConfig,
     data: &[u8],
     doc: Option<&str>,
     events: &Events,
-    print_tx: Option<&Sender<PathBuf>>,
+    print_tx: &Sender<(PathBuf, String)>,
 ) -> Result<()> {
     if data.is_empty() {
         log_warn!("Leerer Druckauftrag ignoriert ({}).", doc.unwrap_or("ohne Namen"));
@@ -140,11 +175,11 @@ fn save_job(
         .filter(|d| !d.is_empty())
         .unwrap_or_else(|| "Druck".into());
 
-    let target = PathBuf::from(&c.target_dir);
+    let target = PathBuf::from(&p.target_dir);
     std::fs::create_dir_all(&target).with_context(|| format!("Zielordner {} nicht anlegbar", target.display()))?;
     let now = chrono::Local::now();
     let stem = logic::render_pattern(
-        &c.filename_pattern,
+        &p.filename_pattern,
         &now.format("%Y-%m-%d").to_string(),
         &now.format("%H-%M-%S").to_string(),
         &titel,
@@ -154,44 +189,48 @@ fn save_job(
     let part = dst.with_extension("pdf.part");
     std::fs::write(&part, data).with_context(|| format!("{} nicht schreibbar", part.display()))?;
     std::fs::rename(&part, &dst)?;
-    log_info!("Gespeichert: {}", dst.display());
+    log_info!("Gespeichert ({}): {}", p.name, dst.display());
 
-    if c.open_after_save {
+    if p.open_after_save {
         ui::open(&dst);
     }
     (events.as_ref())(Event::Saved(dst.clone()));
-    if c.print_after_save {
-        if let Some(tx) = print_tx {
-            let _ = tx.send(dst);
+    if p.print_after_save {
+        match resolve_print_printer(c, p) {
+            Ok(target) => {
+                let _ = print_tx.send((dst, target));
+            }
+            Err(e) => (events.as_ref())(Event::PrintFailed(dst, format!("{e:#}"))),
         }
     }
     Ok(())
 }
 
-/// Zieldrucker für den zusätzlichen Ausdruck; nie der eigene PDF-Drucker (Endlosschleife).
-pub fn resolve_print_printer(c: &Config) -> Result<String> {
-    let name = if c.print_printer.trim().is_empty() {
+/// Zieldrucker für den zusätzlichen Ausdruck; nie ein PDF-Ablage-Drucker (Endlosschleife).
+pub fn resolve_print_printer(c: &Config, p: &PrinterConfig) -> Result<String> {
+    let name = if p.print_printer.trim().is_empty() {
         spooler::default_printer().context("Es ist kein Windows-Standarddrucker eingestellt.")?
     } else {
-        c.print_printer.clone()
+        p.print_printer.clone()
     };
-    if name.eq_ignore_ascii_case(&c.printer_name) {
+    if c.is_own_printer(&name) {
         bail!(
-            "'{name}' ist der PDF-Ablage-Drucker selbst – das ergäbe eine Endlosschleife.\n\
-             Bitte im Menü unter „Ausdrucken auf“ einen echten Drucker wählen."
+            "'{name}' ist selbst ein PDF-Ablage-Drucker – das ergäbe eine Endlosschleife.\n\
+             Bitte in den Einstellungen bei „{}“ einen echten Drucker wählen.",
+            p.name
         );
     }
     Ok(name)
 }
 
 /// Hintergrund-Thread, der PDFs der Reihe nach ausdruckt.
-pub fn start_print_worker(cfg: Arc<Mutex<Config>>, events: Events) -> Sender<PathBuf> {
-    let (tx, rx) = mpsc::channel::<PathBuf>();
+fn start_print_worker(events: Events) -> Sender<(PathBuf, String)> {
+    let (tx, rx) = mpsc::channel::<(PathBuf, String)>();
     thread::spawn(move || {
         let mut printer: Option<pdf::PdfPrinter> = None;
-        for path in rx {
-            match print_one(&mut printer, &cfg, &path) {
-                Ok((pages, target)) => {
+        for (path, target) in rx {
+            match print_one(&mut printer, &path, &target) {
+                Ok(pages) => {
                     log_info!(
                         "Gedruckt ({pages} Seite{}) auf '{target}': {}",
                         if pages == 1 { "" } else { "n" },
@@ -209,22 +248,19 @@ pub fn start_print_worker(cfg: Arc<Mutex<Config>>, events: Events) -> Sender<Pat
     tx
 }
 
-fn print_one(printer: &mut Option<pdf::PdfPrinter>, cfg: &Arc<Mutex<Config>>, path: &Path) -> Result<(usize, String)> {
-    let c = cfg.lock().map(|c| c.clone()).unwrap_or_default();
-    let target = resolve_print_printer(&c)?;
+fn print_one(printer: &mut Option<pdf::PdfPrinter>, path: &Path, target: &str) -> Result<usize> {
     if printer.is_none() {
         *printer = Some(pdf::PdfPrinter::new()?);
     }
     let doc_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let pages = printer.as_ref().context("pdfium nicht geladen")?.print(path, &target, &doc_name)?;
-    Ok((pages, target))
+    printer.as_ref().context("pdfium nicht geladen")?.print(path, target, &doc_name)
 }
 
-/// Überwachung ohne Tray (Befehl "run").
+/// Empfang ohne Tray (Befehl "run").
 pub fn run_console() -> Result<i32> {
     let cfg = Arc::new(Mutex::new(config::load()));
-    let events: Events = Arc::new(|_| {});
-    let tx = start_print_worker(cfg.clone(), events.clone());
-    watch(cfg, Arc::new(AtomicBool::new(false)), events, Some(tx));
-    Ok(0)
+    let _receiver = Receiver::start(cfg, Arc::new(|_| {}));
+    loop {
+        thread::sleep(Duration::from_secs(3600));
+    }
 }
