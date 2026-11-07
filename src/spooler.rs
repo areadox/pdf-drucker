@@ -101,10 +101,6 @@ impl Drop for Printer {
     }
 }
 
-pub fn printer_exists(name: &str) -> bool {
-    Printer::open(name).is_some()
-}
-
 pub fn port_name(name: &str) -> Option<String> {
     Printer::open(name)?.port_name()
 }

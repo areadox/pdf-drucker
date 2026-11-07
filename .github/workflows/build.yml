@@ -94,7 +94,8 @@ jobs:
           function Print-All($namen, $drucker) {
             foreach ($n in $namen) { Run-App @('make-test-pdf', "$tmp\$n.pdf") }
             foreach ($n in $namen) {
-              Start-Process $exe -ArgumentList @('print', "$tmp\$n.pdf", $drucker) -PassThru -NoNewWindow `
+              # Argumente selbst in Anführungszeichen setzen (Start-Process tut das bei Leerzeichen nicht)
+              Start-Process $exe -ArgumentList "print `"$tmp\$n.pdf`" `"$drucker`"" -PassThru -NoNewWindow `
                 -RedirectStandardOutput "$tmp\$n.out" -RedirectStandardError "$tmp\$n.err"
             }
           }
