@@ -90,56 +90,46 @@ pub fn sync_printers(cfg: &Config) -> Result<String> {
         .creation_flags(CREATE_NO_WINDOW)
         .output();
 
-    let old_port = ps_quote(&config::old_spool_file().to_string_lossy());
-    let first_pipe = ps_quote(config::PIPE_NAME);
+    let port = ps_quote(config::PIPE_NAME);
     let mut script = ps_is_our();
-    script.push_str(
-        r#"
-$drv = (Get-PrinterDriver | Where-Object { $_.Name -like '*Print*PDF*' } | Select-Object -First 1).Name
-if (-not $drv) {
-    Enable-WindowsOptionalFeature -Online -FeatureName Printing-PrintToPDFServices-Features -NoRestart | Out-Null
-    $drv = (Get-PrinterDriver | Where-Object { $_.Name -like '*Print*PDF*' } | Select-Object -First 1).Name
-}
-if (-not $drv) { throw 'Treiber "Microsoft Print to PDF" nicht gefunden.' }
-$managed = @(Get-Printer | Where-Object { IsOur $_.PortName })
-
-function Sync-One($name, $port) {
-    if (-not (Get-PrinterPort -Name $port -ErrorAction SilentlyContinue)) { Add-PrinterPort -Name $port }
-    $cur = $managed | Where-Object { $_.PortName -eq $port } | Select-Object -First 1
-"#,
-    );
     script.push_str(&format!(
-        "    if (-not $cur -and $port -eq {first_pipe}) {{ $cur = $managed | Where-Object {{ $_.PortName -eq {old_port} }} | Select-Object -First 1 }}\n"
-    ));
-    script.push_str(
-        r#"    $same = Get-Printer -Name $name -ErrorAction SilentlyContinue
-    if ($cur) {
-        if ($cur.Name -ne $name) {
-            if ($same) { throw "Der Name '$name' ist bereits von einem anderen Drucker belegt." }
-            Rename-Printer -Name $cur.Name -NewName $name
-        }
-        Set-Printer -Name $name -PortName $port
-    } elseif ($same) {
-        if (-not (IsOur $same.PortName)) { throw "Der Name '$name' ist bereits von einem anderen Drucker belegt." }
-        Set-Printer -Name $name -PortName $port
-    } else {
+        r#"
+$drv = (Get-PrinterDriver | Where-Object {{ $_.Name -like '*Print*PDF*' }} | Select-Object -First 1).Name
+if (-not $drv) {{
+    Enable-WindowsOptionalFeature -Online -FeatureName Printing-PrintToPDFServices-Features -NoRestart | Out-Null
+    $drv = (Get-PrinterDriver | Where-Object {{ $_.Name -like '*Print*PDF*' }} | Select-Object -First 1).Name
+}}
+if (-not $drv) {{ throw 'Treiber "Microsoft Print to PDF" nicht gefunden.' }}
+# Ein gemeinsamer Anschluss für alle PDF-Ablage-Drucker
+$port = {port}
+if (-not (Get-PrinterPort -Name $port -ErrorAction SilentlyContinue)) {{ Add-PrinterPort -Name $port }}
+$managed = @(Get-Printer | Where-Object {{ IsOur $_.PortName }})
+
+function Sync-One($name, $oldName) {{
+    $same = Get-Printer -Name $name -ErrorAction SilentlyContinue
+    if ($same) {{
+        if (-not (IsOur $same.PortName)) {{ throw "Der Name '$name' ist bereits von einem anderen Drucker belegt." }}
+    }} elseif ($oldName -and ($managed | Where-Object {{ $_.Name -eq $oldName }})) {{
+        Rename-Printer -Name $oldName -NewName $name
+    }} else {{
         Add-Printer -Name $name -DriverName $drv -PortName $port
-    }
+    }}
+    Set-Printer -Name $name -PortName $port
     Set-Printer -Name $name -KeepPrintedJobs $false
-}
-"#,
-    );
-    let wanted: Vec<String> = cfg.printers.iter().map(|p| ps_quote(&p.pipe())).collect();
+}}
+"#
+    ));
     for p in &cfg.printers {
-        script.push_str(&format!("Sync-One {} {}\n", ps_quote(&p.name), ps_quote(&p.pipe())));
+        script.push_str(&format!("Sync-One {} {}\n", ps_quote(&p.name), ps_quote(&p.installed_name)));
     }
+    let wanted: Vec<String> = cfg.printers.iter().map(|p| ps_quote(&p.name)).collect();
     script.push_str(&format!(
         r#"$wanted = @({})
 foreach ($p in @(Get-Printer | Where-Object {{ IsOur $_.PortName }})) {{
-    if ($wanted -notcontains $p.PortName) {{ Remove-Printer -Name $p.Name }}
+    if ($wanted -notcontains $p.Name) {{ Remove-Printer -Name $p.Name }}
 }}
-foreach ($port in @(Get-PrinterPort | Where-Object {{ IsOur $_.Name }})) {{
-    if ($wanted -notcontains $port.Name) {{ Remove-PrinterPort -Name $port.Name -ErrorAction SilentlyContinue }}
+foreach ($pt in @(Get-PrinterPort | Where-Object {{ IsOur $_.Name }})) {{
+    if ($pt.Name -ne $port) {{ Remove-PrinterPort -Name $pt.Name -ErrorAction SilentlyContinue }}
 }}
 "#,
         wanted.join(", ")
@@ -149,6 +139,12 @@ foreach ($port in @(Get-PrinterPort | Where-Object {{ IsOur $_.Name }})) {{
     if !ok {
         bail!("Fehler beim Einrichten der Drucker:\n{text}");
     }
+    // Eingerichtete Namen merken (zum Erkennen späterer Umbenennungen)
+    let mut done = cfg.clone();
+    for p in &mut done.printers {
+        p.installed_name = p.name.clone();
+    }
+    config::save(&done)?;
     let list: Vec<String> = cfg.printers.iter().map(|p| format!("• {} → {}", p.name, p.all_dirs().join(" + "))).collect();
     log_info!("Drucker abgeglichen: {}", list.join("; "));
     Ok(format!("Drucker eingerichtet:\n{}", list.join("\n")))

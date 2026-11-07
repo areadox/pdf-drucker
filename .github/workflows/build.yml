@@ -147,8 +147,8 @@ jobs:
           }
           Run-App @('sync')
           Our-Printers | Format-Table Name, PortName
-          if ((Get-Printer -Name 'PDF-Ablage Rechnungen').PortName -ne '\\.\pipe\PDFAblage-2') { throw 'Drucker 2 falsch eingerichtet' }
-          if ((Get-Printer -Name 'PDF-Ablage Belege').PortName -ne '\\.\pipe\PDFAblage-3') { throw 'Drucker 3 falsch eingerichtet' }
+          if ((Our-Printers).Count -ne 3) { throw 'Es sollten 3 PDF-Ablage-Drucker sein' }
+          if (@(Our-Printers | Where-Object PortName -ne '\\.\pipe\PDFAblage').Count -gt 0) { throw 'Nicht alle Drucker nutzen den gemeinsamen Anschluss' }
 
           "== Auf allen drei Druckern gleichzeitig drucken =="
           $w = Start-Process $exe -ArgumentList 'run' -PassThru -NoNewWindow
@@ -184,7 +184,7 @@ jobs:
           Edit-Config { param($c) ($c.printers | Where-Object id -eq 3).name = 'PDF-Ablage Quittungen' }
           Run-App @('sync')
           if (Get-Printer -Name 'PDF-Ablage Belege' -ErrorAction SilentlyContinue) { throw 'Alter Name existiert noch' }
-          if ((Get-Printer -Name 'PDF-Ablage Quittungen').PortName -ne '\\.\pipe\PDFAblage-3') { throw 'Umbenennen fehlgeschlagen' }
+          if ((Get-Printer -Name 'PDF-Ablage Quittungen').PortName -ne '\\.\pipe\PDFAblage') { throw 'Umbenennen fehlgeschlagen' }
           Stop-Process $w -Force -ErrorAction SilentlyContinue
           $w = Start-Process $exe -ArgumentList 'run' -PassThru -NoNewWindow
           Start-Sleep 2

@@ -162,6 +162,29 @@ pub fn current_job(printer: &str) -> Option<Job> {
     None
 }
 
+/// Der Auftrag, der gerade auf einem der Drucker läuft (alle teilen sich einen Anschluss,
+/// daher läuft immer nur einer). Gibt Drucker-Nr. und Auftrag zurück.
+pub fn current_job_any(printers: &[(u8, String)]) -> Option<(u8, Job)> {
+    let handles: Vec<(u8, Printer)> =
+        printers.iter().filter_map(|(id, name)| Printer::open(name).map(|p| (*id, p))).collect();
+    for attempt in 0..10 {
+        let all: Vec<(u8, Job)> =
+            handles.iter().flat_map(|(id, p)| p.jobs().into_iter().map(move |j| (*id, j))).collect();
+        if let Some(found) = all.iter().find(|(_, j)| j.status & JOB_STATUS_PRINTING != 0) {
+            return Some(found.clone());
+        }
+        // Status noch nicht aktualisiert: bei nur einem offenen Auftrag ist es dieser
+        if attempt >= 3 {
+            let open: Vec<&(u8, Job)> = all.iter().filter(|(_, j)| !j.finished()).collect();
+            if open.len() == 1 {
+                return Some(open[0].clone());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
+}
+
 /// Auftrag `id` auf `printer` neu starten.
 pub fn restart_job(printer: &str, id: u32) -> bool {
     Printer::open(printer).is_some_and(|p| p.restart_job(id))

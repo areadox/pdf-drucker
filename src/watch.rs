@@ -4,11 +4,12 @@
 //! pro Auftrag). Dadurch kann nichts überschrieben werden, auch wenn mehrere Dokumente direkt
 //! hintereinander oder auf mehreren Druckern gleichzeitig gedruckt werden.
 
-use crate::config::{self, Config, PrinterConfig};
+use crate::config::{self, Config, PrinterConfig, PIPE_NAME};
 use crate::util::wide;
 use crate::{logic, pdf, spooler, ui};
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::mpsc::{self, Sender};
@@ -42,7 +43,10 @@ type Job = (u8, Vec<u8>, Option<String>);
 pub struct Receiver {
     cfg: Arc<Mutex<Config>>,
     job_tx: Sender<Job>,
-    started: Mutex<HashSet<u8>>,
+    /// Drucker, für die der Empfang schon gemeldet wurde
+    announced: Mutex<HashSet<u8>>,
+    server_started: AtomicBool,
+    events: Events,
     /// Neustarts leerer Aufträge je (Drucker-Nr., Auftrags-ID)
     restarts: Mutex<HashMap<(u8, u32), u8>>,
 }
@@ -55,7 +59,7 @@ impl Receiver {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         {
             // Aufträge werden der Reihe nach abgelegt
-            let cfg = cfg.clone();
+            let (cfg, events) = (cfg.clone(), events.clone());
             thread::spawn(move || {
                 for (id, data, doc) in job_rx {
                     let c = lock(&cfg);
@@ -69,29 +73,33 @@ impl Receiver {
         let r = Arc::new(Receiver {
             cfg,
             job_tx,
-            started: Mutex::new(HashSet::new()),
+            announced: Mutex::new(HashSet::new()),
+            server_started: AtomicBool::new(false),
+            events,
             restarts: Mutex::new(HashMap::new()),
         });
         r.ensure_servers();
         r
     }
 
-    /// Startet für jeden eingestellten Drucker einen Pipe-Empfang (bereits laufende bleiben).
+    /// Startet den Empfang (einmal für alle Drucker) und meldet neu hinzugekommene Drucker.
     pub fn ensure_servers(self: &Arc<Self>) {
         let printers = lock(&self.cfg).printers;
-        let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
+        let mut announced = self.announced.lock().unwrap_or_else(|e| e.into_inner());
         for p in printers {
-            if started.insert(p.id) {
-                log_info!("Empfange Druckaufträge für „{}“ über {} -> {}", p.name, p.pipe(), p.all_dirs().join(" + "));
-                let me = self.clone();
-                thread::spawn(move || me.serve(p.id));
+            if announced.insert(p.id) {
+                log_info!("Empfange Druckaufträge für „{}“ über {} -> {}", p.name, PIPE_NAME, p.all_dirs().join(" + "));
             }
+        }
+        if !self.server_started.swap(true, Ordering::SeqCst) {
+            let me = self.clone();
+            thread::spawn(move || me.serve());
         }
     }
 
-    fn serve(self: Arc<Self>, id: u8) {
-        let pipe = config::pipe_name(id);
-        let name = wide(&pipe);
+    fn serve(self: Arc<Self>) {
+        let pipe = PIPE_NAME;
+        let name = wide(pipe);
         let mut failures = 0u32;
         loop {
             // Neue Pipe-Instanz anlegen, auf den nächsten Auftrag warten
@@ -126,15 +134,20 @@ impl Receiver {
             }
             // Lesen in eigenem Thread, damit sofort die nächste Pipe-Instanz bereitsteht
             let (h, me) = (h as usize, self.clone());
-            thread::spawn(move || me.receive(id, h as HANDLE));
+            thread::spawn(move || me.receive(h as HANDLE));
         }
     }
 
     /// Liest einen Auftrag aus der verbundenen Pipe.
-    fn receive(&self, id: u8, h: HANDLE) {
-        // Genau jetzt läuft der Auftrag, der in die Pipe schreibt -> Dokumentname passt sicher
-        let printer = lock(&self.cfg).printer(id).map(|p| p.name.clone());
-        let job = printer.as_deref().and_then(spooler::current_job);
+    fn receive(&self, h: HANDLE) {
+        // Genau jetzt läuft der Auftrag, der in die Pipe schreibt -> Drucker und Dokumentname
+        // passen sicher (alle Drucker teilen sich den Anschluss, es läuft immer nur ein Auftrag)
+        let c = lock(&self.cfg);
+        let names: Vec<(u8, String)> = c.printers.iter().map(|p| (p.id, p.name.clone())).collect();
+        let found = spooler::current_job_any(&names);
+        let id = found.as_ref().map(|(id, _)| *id).unwrap_or_else(|| c.first().id);
+        let printer = c.printer(id).map(|p| p.name.clone());
+        let job = found.map(|(_, j)| j);
         let data = read_all(h);
         unsafe {
             DisconnectNamedPipe(h);
@@ -159,14 +172,23 @@ impl Receiver {
                 };
                 if n <= MAX_RESTARTS {
                     log_warn!("Leere Übertragung von „{}“ ({}), starte Auftrag neu ({n}/{MAX_RESTARTS}).", job.document, printer);
+                    let events = self.events.clone();
                     thread::spawn(move || {
                         thread::sleep(Duration::from_secs(2));
                         if !spooler::restart_job(&printer, job.id) {
                             log_error!("Auftrag „{}“ konnte nicht neu gestartet werden.", job.document);
+                            (events.as_ref())(Event::SaveFailed(
+                                printer,
+                                format!("„{}“ ist leer angekommen und wurde nicht gespeichert. Bitte erneut drucken.", job.document),
+                            ));
                         }
                     });
                 } else {
                     log_error!("Auftrag „{}“ ({printer}) kam auch nach {MAX_RESTARTS} Versuchen leer an.", job.document);
+                    (self.events.as_ref())(Event::SaveFailed(
+                        printer,
+                        format!("„{}“ ist leer angekommen und wurde nicht gespeichert.", job.document),
+                    ));
                 }
             } else {
                 log_warn!("Leerer Druckauftrag ohne zugehörigen Auftrag ignoriert.");

@@ -26,17 +26,10 @@ pub fn app_dir() -> PathBuf {
     PathBuf::from(base).join("PDFDrucker")
 }
 
-/// Anschluss des ersten Druckers: Windows schreibt jeden Druckauftrag einzeln in diese Pipe.
+/// Gemeinsamer Anschluss aller PDF-Ablage-Drucker: Windows schreibt jeden Druckauftrag einzeln
+/// in diese Pipe. Weil sich alle Drucker den Anschluss teilen, arbeitet Windows die Aufträge
+/// nacheinander ab – der PDF-Treiber verträgt keine gleichzeitigen Aufträge mehrerer Drucker.
 pub const PIPE_NAME: &str = r"\\.\pipe\PDFAblage";
-
-/// Pipe für Drucker Nr. `id` (1 behält den bisherigen Namen).
-pub fn pipe_name(id: u8) -> String {
-    if id <= 1 {
-        PIPE_NAME.to_string()
-    } else {
-        format!("{PIPE_NAME}-{id}")
-    }
-}
 
 /// Anschluss älterer Versionen (feste Datei), wird bei der Einrichtung entfernt.
 pub fn old_spool_file() -> PathBuf {
@@ -65,10 +58,12 @@ fn documents_dir() -> PathBuf {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrinterConfig {
-    /// 1–5, bestimmt den Anschluss (Pipe) – bleibt beim Umbenennen gleich
+    /// 1–5, bleibt beim Umbenennen gleich
     pub id: u8,
     /// Name des Druckers in Windows
     pub name: String,
+    /// Name beim letzten Einrichten in Windows (zum Erkennen von Umbenennungen)
+    pub installed_name: String,
     /// Hauptordner (für „Zielordner öffnen“, „Nach dem Speichern öffnen“ und den Ausdruck)
     pub target_dir: String,
     /// Weitere Speicherorte – die PDF wird zusätzlich in jedem davon gespeichert (bis zu 4)
@@ -88,6 +83,7 @@ impl PrinterConfig {
             id,
             target_dir: documents_dir().join(&name).to_string_lossy().into_owned(),
             name,
+            installed_name: String::new(),
             extra_dirs: Vec::new(),
             filename_pattern: DEFAULT_PATTERN.into(),
             open_after_save: false,
@@ -97,7 +93,7 @@ impl PrinterConfig {
     }
 
     pub fn pipe(&self) -> String {
-        pipe_name(self.id)
+        PIPE_NAME.to_string()
     }
 
     /// Alle Speicherorte: Hauptordner zuerst, ohne leere und doppelte, höchstens 5.
@@ -320,7 +316,6 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec![1, 2, 3, 4, 5]);
         assert_eq!(Config::free_id(&c.printers), None);
-        assert_eq!(pipe_name(3), r"\\.\pipe\PDFAblage-3");
     }
 
     #[test]
