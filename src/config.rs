@@ -92,10 +92,6 @@ impl PrinterConfig {
         }
     }
 
-    pub fn pipe(&self) -> String {
-        PIPE_NAME.to_string()
-    }
-
     /// Alle Speicherorte: Hauptordner zuerst, ohne leere und doppelte, höchstens 5.
     pub fn all_dirs(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
@@ -304,7 +300,7 @@ mod tests {
         let c = parse("{}");
         assert_eq!(c.printers.len(), 1);
         assert_eq!(c.printers[0].name, "PDF-Ablage");
-        assert_eq!(c.printers[0].pipe(), r"\\.\pipe\PDFAblage");
+        assert_eq!(c.printers[0].filename_pattern, "{datum}_{uhrzeit}_{titel}.pdf");
     }
 
     #[test]
