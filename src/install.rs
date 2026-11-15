@@ -5,11 +5,13 @@
 //! Einstellungen stehen. Dafür sind Administratorrechte nötig.
 
 use crate::config::{self, Config, APP_NAME};
-use crate::{spooler, ui};
+use crate::{logic, spooler, ui};
 use anyhow::{anyhow, bail, Result};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use winreg::enums::HKEY_CURRENT_USER;
 use winreg::RegKey;
 
@@ -47,19 +49,41 @@ fn ps_is_our() -> String {
     )
 }
 
-/// Probleme zwischen Einstellungen und Windows-Druckern (leer = alles passt).
+/// Prüft, ob alle eingestellten Drucker samt Anschluss und Treiber korrekt in Windows
+/// eingerichtet sind und noch auf PDF-Ablage zeigen. Braucht keine Administratorrechte.
+pub fn printer_problems(cfg: &Config) -> Vec<logic::Problem> {
+    let names: Vec<String> = cfg.printers.iter().map(|p| p.name.clone()).collect();
+    let ports = spooler::ports();
+    let drivers = spooler::drivers();
+    let old = config::old_spool_file().to_string_lossy().into_owned();
+    logic::diagnose(
+        &names,
+        config::PIPE_NAME,
+        |port| port.eq_ignore_ascii_case(&old),
+        spooler::printer_state,
+        ports.as_deref(),
+        drivers.as_deref(),
+    )
+}
+
+/// Probleme als Text für Meldungen (leer = alles passt).
 pub fn windows_problems(cfg: &Config) -> Vec<String> {
-    let mut out = Vec::new();
-    for p in &cfg.printers {
-        match spooler::port_name(&p.name) {
-            None => out.push(format!("„{}“ ist in Windows noch nicht eingerichtet.", p.name)),
-            Some(port) if !port.eq_ignore_ascii_case(&p.pipe()) => {
-                out.push(format!("„{}“ muss aktualisiert werden.", p.name))
-            }
-            _ => {}
-        }
+    printer_problems(cfg).iter().map(|p| p.to_string()).collect()
+}
+
+static SYNC_STARTED: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Merkt sich, dass gerade eine Einrichtung mit Administratorrechten angestoßen wurde
+/// (z. B. aus dem Einstellungsfenster) – die Hintergrundprüfung wartet dann ab.
+pub fn note_sync_started() {
+    if let Ok(mut g) = SYNC_STARTED.lock() {
+        *g = Some(Instant::now());
     }
-    out
+}
+
+/// Wurde in den letzten drei Minuten eine Einrichtung angestoßen?
+pub fn sync_recent() -> bool {
+    SYNC_STARTED.lock().ok().and_then(|g| *g).is_some_and(|t| t.elapsed() < Duration::from_secs(180))
 }
 
 /// Gleicht die Windows-Drucker mit den Einstellungen ab (Administratorrechte nötig).
@@ -108,7 +132,10 @@ $managed = @(Get-Printer | Where-Object {{ IsOur $_.PortName }})
 function Sync-One($name, $oldName) {{
     $same = Get-Printer -Name $name -ErrorAction SilentlyContinue
     if ($same) {{
-        if (-not (IsOur $same.PortName)) {{ throw "Der Name '$name' ist bereits von einem anderen Drucker belegt." }}
+        # Ein schon einmal von PDF-Ablage eingerichteter Drucker, dessen Anschluss verbogen wurde
+        # (z. B. durch ein Windows-Update), wird zurückgeholt; fremde Drucker bleiben unangetastet
+        if (-not (IsOur $same.PortName) -and ($oldName -ne $name)) {{ throw "Der Name '$name' ist bereits von einem anderen Drucker belegt." }}
+        if ($same.DriverName -notlike '*Print*PDF*') {{ Set-Printer -Name $name -DriverName $drv }}
     }} elseif ($oldName -and ($managed | Where-Object {{ $_.Name -eq $oldName }})) {{
         Rename-Printer -Name $oldName -NewName $name
     }} else {{
@@ -177,6 +204,47 @@ pub fn cmd_sync() -> Result<i32> {
     }
     ui::message(&sync_printers(&config::load())?, false);
     Ok(0)
+}
+
+/// Befehl "pruefen": Einrichtung in Windows prüfen (ohne Administratorrechte).
+/// Exit-Code 0 = alles in Ordnung, 1 = Probleme gefunden.
+pub fn cmd_check() -> Result<i32> {
+    let problems = windows_problems(&config::load());
+    if problems.is_empty() {
+        ui::message("Alle PDF-Ablage-Drucker sind korrekt eingerichtet.", false);
+        return Ok(0);
+    }
+    log_warn!("Druckerprüfung: {}", problems.join(" | "));
+    ui::message(&format!("Probleme gefunden:\n{}", problems.join("\n")), true);
+    Ok(1)
+}
+
+/// Befehl "reparieren": wird von der Tray-App mit Administratorrechten gestartet. Zeigt keine
+/// Fenster, schreibt alles ins Protokoll. Exit-Code 0 = repariert bzw. alles in Ordnung.
+pub fn cmd_repair() -> Result<i32> {
+    if !ui::is_admin() {
+        log_error!("Reparatur ohne Administratorrechte nicht möglich.");
+        return Ok(2);
+    }
+    let cfg = config::load();
+    let before = windows_problems(&cfg);
+    if before.is_empty() {
+        log_info!("Reparatur: alle Drucker sind korrekt eingerichtet.");
+        return Ok(0);
+    }
+    log_warn!("Reparatur gestartet: {}", before.join(" | "));
+    if let Err(e) = sync_printers(&cfg) {
+        log_error!("Reparatur fehlgeschlagen: {e:#}");
+        return Ok(1);
+    }
+    let after = windows_problems(&config::load());
+    if after.is_empty() {
+        log_info!("Reparatur erfolgreich.");
+        Ok(0)
+    } else {
+        log_error!("Nach der Reparatur bestehen weiter Probleme: {}", after.join(" | "));
+        Ok(1)
+    }
 }
 
 pub fn cmd_uninstall() -> Result<i32> {

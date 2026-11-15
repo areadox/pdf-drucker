@@ -14,7 +14,7 @@ pub const SETUP_ASSET: &str = "PDF-Ablage-Setup.exe";
 pub const MAX_PRINTERS: usize = 5;
 /// Speicherorte je Drucker (Hauptordner + bis zu 4 weitere)
 pub const MAX_DIRS: usize = 5;
-pub const DEFAULT_PATTERN: &str = "{datum}_{zeit}_{titel}";
+pub const DEFAULT_PATTERN: &str = "{datum}_{uhrzeit}_{titel}.pdf";
 
 /// Entwicklungs-Builds (ohne Versionsnummer) suchen nicht nach Updates.
 pub fn is_dev_build() -> bool {
@@ -68,7 +68,7 @@ pub struct PrinterConfig {
     pub target_dir: String,
     /// Weitere Speicherorte – die PDF wird zusätzlich in jedem davon gespeichert (bis zu 4)
     pub extra_dirs: Vec<String>,
-    /// Platzhalter: {datum} {zeit} {titel}
+    /// Dateinamen-Vorlage, Platzhalter: {titel} {datum} {uhrzeit} {programm} ({zeit} = {uhrzeit})
     pub filename_pattern: String,
     pub open_after_save: bool,
     /// Gespeicherte PDF zusätzlich ausdrucken ("" = Windows-Standarddrucker)

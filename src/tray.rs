@@ -38,7 +38,7 @@ const ID_SETTINGS: usize = 10;
 const ID_OPEN_FIRST: usize = 100; // 100.. = Zielordner von Drucker 1..5
 const ID_NOTIFY: usize = 22;
 const ID_AUTOSTART: usize = 23;
-const ID_INSTALL: usize = 30;
+const ID_REPAIR: usize = 30;
 const ID_UNINSTALL: usize = 31;
 const ID_LOG: usize = 32;
 const ID_UPDATE: usize = 40;
@@ -55,6 +55,12 @@ struct State {
 static STATE: OnceLock<State> = OnceLock::new();
 static HWND_VAL: AtomicUsize = AtomicUsize::new(0);
 static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
+static REPAIR_RUNNING: AtomicBool = AtomicBool::new(false);
+/// Zuletzt gemeldete Probleme – dieselben Probleme lösen nicht alle paar Minuten erneut eine
+/// Administrator-Abfrage aus, wenn sie einmal abgelehnt wurde.
+static LAST_PROBLEMS: Mutex<String> = Mutex::new(String::new());
+/// Abstand der Hintergrundprüfung
+const CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 struct Notice {
     title: String,
@@ -202,7 +208,7 @@ fn show_menu(hwnd: HWND) {
         check(menu, ID_NOTIFY, "Benachrichtigung anzeigen", c.notify);
         check(menu, ID_AUTOSTART, "Mit Windows starten", install::autostart_enabled());
         separator(menu);
-        item(menu, MF_STRING, ID_INSTALL, "Drucker in Windows einrichten …");
+        item(menu, MF_STRING, ID_REPAIR, "Drucker prüfen / reparieren …");
         item(menu, MF_STRING, ID_UNINSTALL, "Alle Drucker entfernen …");
         item(menu, MF_STRING, ID_LOG, "Protokoll öffnen");
         separator(menu);
@@ -252,13 +258,13 @@ fn handle_command(id: usize) {
                 ui::message(&format!("Autostart konnte nicht geändert werden:\n{e:#}"), true);
             }
         }
-        ID_INSTALL => {
-            ui::run_elevated("sync");
+        ID_REPAIR => {
+            thread::spawn(|| check_and_repair(true));
         }
         ID_UNINSTALL => {
             if ui::ask(
                 "Alle PDF-Ablage-Drucker aus Windows entfernen?\n\nDie Einstellungen und gespeicherten PDFs bleiben erhalten; \
-                 über „Drucker in Windows einrichten …“ lassen sich die Drucker wieder anlegen.",
+                 über „Drucker prüfen / reparieren …“ lassen sich die Drucker wieder anlegen.",
                 APP_NAME,
             ) {
                 ui::run_elevated("uninstall");
@@ -414,18 +420,95 @@ fn apply_autostart_default(cfg: &Arc<Mutex<Config>>) {
     }
 }
 
-fn check_printer_setup(c: &Config) {
-    let problems = install::windows_problems(c);
-    if problems.is_empty() {
+/// Prüft Drucker, Anschluss und Treiber und repariert sie bei Bedarf (Administrator-Abfrage).
+///
+/// `manual`: über das Tray-Menü angestoßen – dann gibt es immer eine Rückmeldung, auch wenn
+/// alles stimmt, und die Reparatur wird auch bei schon einmal gemeldeten Problemen versucht.
+fn check_and_repair(manual: bool) {
+    if REPAIR_RUNNING.swap(true, Ordering::SeqCst) {
         return;
     }
-    let text = format!(
-        "{}\n\nJetzt in Windows einrichten? (Administratorrechte nötig)",
-        problems.join("\n")
-    );
-    if ui::ask(&text, APP_NAME) {
-        ui::run_elevated("sync");
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            REPAIR_RUNNING.store(false, Ordering::SeqCst);
+        }
     }
+    let _reset = Reset;
+
+    let c = cfg();
+    let problems = install::windows_problems(&c);
+    let mut last = LAST_PROBLEMS.lock().unwrap_or_else(|e| e.into_inner());
+    if problems.is_empty() {
+        if !last.is_empty() {
+            log_info!("Druckerprüfung: wieder alles in Ordnung.");
+        }
+        last.clear();
+        if manual {
+            post_notice("Drucker geprüft", "Alle PDF-Ablage-Drucker sind korrekt eingerichtet.", false);
+        }
+        return;
+    }
+    let text = problems.join("\n");
+    if !manual {
+        // Gerade läuft eine Einrichtung aus dem Einstellungsfenster, oder dieselben Probleme
+        // wurden schon gemeldet (Abfrage abgelehnt) – dann nicht erneut nachfragen
+        if install::sync_recent() || *last == text {
+            return;
+        }
+    }
+    *last = text.clone();
+    drop(last);
+    log_warn!("Druckerprüfung: {}", problems.join(" | "));
+
+    let first_setup = c.printers.iter().all(|p| p.installed_name.is_empty());
+    if !manual && ui::no_gui() {
+        return; // Testumgebung ohne Fenster: nur protokollieren
+    }
+    let (title, hint) = if first_setup {
+        ("Drucker einrichten", "Bitte die Administrator-Abfrage bestätigen.")
+    } else {
+        ("Drucker wird repariert", "Windows hat die Einrichtung verändert. Bitte die Administrator-Abfrage bestätigen.")
+    };
+    post_notice(title, &format!("{text}\n{hint}"), !first_setup);
+
+    match ui::run_elevated_wait("reparieren", Duration::from_secs(10 * 60)) {
+        None => {
+            log_warn!("Reparatur nicht ausgeführt (Administrator-Abfrage abgelehnt oder nicht möglich).");
+            post_notice(
+                "Drucker nicht repariert",
+                "Ohne Administratorrechte geht es nicht. Bis dahin speichert PDF-Ablage nicht automatisch. \
+                 Erneut versuchen: Tray-Menü → „Drucker prüfen / reparieren …“",
+                true,
+            );
+        }
+        Some(code) => {
+            let after = install::windows_problems(&cfg());
+            if after.is_empty() {
+                log_info!("Drucker repariert (Exit {code}).");
+                if let Ok(mut l) = LAST_PROBLEMS.lock() {
+                    l.clear();
+                }
+                let done = if first_setup { "Drucker eingerichtet" } else { "Drucker repariert" };
+                post_notice(done, "PDF-Ablage speichert wieder automatisch.", false);
+            } else {
+                log_error!("Reparatur fehlgeschlagen (Exit {code}): {}", after.join(" | "));
+                post_notice(
+                    "Reparatur fehlgeschlagen",
+                    &format!("{}\nDetails: Tray-Menü → „Protokoll öffnen“", after.join("\n")),
+                    true,
+                );
+            }
+        }
+    }
+}
+
+/// Prüft beim Start und danach regelmäßig im Hintergrund die Einrichtung in Windows.
+fn start_printer_watch() {
+    thread::spawn(|| loop {
+        check_and_repair(false);
+        thread::sleep(CHECK_INTERVAL);
+    });
 }
 
 /// Läuft die Tray-App schon? Dann dort die Einstellungen öffnen.
@@ -486,7 +569,7 @@ pub fn run(after_update: bool) -> Result<i32> {
         })
     };
     let _ = state().receiver.set(Receiver::start(cfg.clone(), events));
-    check_printer_setup(&cfg.lock().map(|c| c.clone()).unwrap_or_default());
+    start_printer_watch();
     {
         let cfg = cfg.clone();
         thread::spawn(move || {

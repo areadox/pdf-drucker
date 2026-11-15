@@ -31,6 +31,8 @@ Befehle:
   PDF-Ablage.exe sync                     alle Drucker gemäß Einstellungen einrichten (Administrator)
   PDF-Ablage.exe install [--name NAME] [--ordner PFAD]   ersten Drucker einrichten (Administrator)
   PDF-Ablage.exe uninstall                alle PDF-Ablage-Drucker entfernen (Administrator)
+  PDF-Ablage.exe pruefen                  Drucker, Anschluss und Treiber prüfen (Exit 1 bei Problemen)
+  PDF-Ablage.exe reparieren               fehlende/veränderte Drucker reparieren (Administrator, ohne Fenster)
   PDF-Ablage.exe run                      Überwachung ohne Tray
   PDF-Ablage.exe autostart [--aus]        beim Anmelden starten / nicht mehr starten
   PDF-Ablage.exe config                   Einstellungen anzeigen
@@ -67,6 +69,8 @@ fn run(cmd: &str, args: &[String]) -> Result<i32> {
         "install" => install::cmd_install(option(args, "--name"), option(args, "--ordner")),
         "uninstall" => install::cmd_uninstall(),
         "sync" => install::cmd_sync(),
+        "pruefen" | "check" => install::cmd_check(),
+        "reparieren" | "repair" => install::cmd_repair(),
         "einstellungen" | "settings" => {
             if !tray::signal_running_instance() {
                 settings::run_standalone();

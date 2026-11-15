@@ -8,8 +8,8 @@ use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::time::Duration;
 use windows_sys::Win32::Graphics::Printing::{
-    ClosePrinter, EnumJobsW, EnumPrintersW, GetDefaultPrinterW, GetPrinterW, OpenPrinterW, SetJobW,
-    JOB_INFO_1W, PRINTER_INFO_2W, PRINTER_INFO_4W,
+    ClosePrinter, EnumJobsW, EnumPortsW, EnumPrinterDriversW, EnumPrintersW, GetDefaultPrinterW, GetPrinterW,
+    OpenPrinterW, SetJobW, DRIVER_INFO_1W, JOB_INFO_1W, PORT_INFO_1W, PRINTER_INFO_2W, PRINTER_INFO_4W,
 };
 
 const JOB_STATUS_PRINTING: u32 = 0x0000_0010;
@@ -87,15 +87,18 @@ impl Printer {
         unsafe { SetJobW(self.0, id, 0, null(), JOB_CONTROL_RESTART) != 0 }
     }
 
-    /// Anschluss (Port) des Druckers.
-    pub fn port_name(&self) -> Option<String> {
+    /// Anschluss (Port) und Treiber des Druckers.
+    pub fn state(&self) -> Option<PrinterState> {
         let h = self.0;
         let (buf, _) = two_pass(|p, cb, need, _| unsafe { GetPrinterW(h, 2, p, cb, need) })?;
         if buf.is_empty() {
             return None;
         }
         let info = unsafe { &*(buf.as_ptr() as *const PRINTER_INFO_2W) };
-        Some(unsafe { from_wide_ptr(info.pPortName) })
+        Some(PrinterState {
+            port: unsafe { from_wide_ptr(info.pPortName) },
+            driver: unsafe { from_wide_ptr(info.pDriverName) },
+        })
     }
 }
 
@@ -107,8 +110,37 @@ impl Drop for Printer {
     }
 }
 
+pub use crate::logic::PrinterState;
+
 pub fn port_name(name: &str) -> Option<String> {
-    Printer::open(name)?.port_name()
+    printer_state(name).map(|s| s.port)
+}
+
+/// Anschluss und Treiber eines Druckers (`None`, wenn es ihn nicht gibt).
+pub fn printer_state(name: &str) -> Option<PrinterState> {
+    Printer::open(name)?.state()
+}
+
+/// Alle Anschlüsse (Ports) in Windows; `None`, wenn die Liste nicht lesbar ist.
+pub fn ports() -> Option<Vec<String>> {
+    let (buf, count) =
+        two_pass(|p, cb, need, ret| unsafe { EnumPortsW(null(), 1, p, cb, need, ret) })?;
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    let infos = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const PORT_INFO_1W, count as usize) };
+    Some(infos.iter().map(|i| unsafe { from_wide_ptr(i.pName) }).collect())
+}
+
+/// Alle installierten Druckertreiber; `None`, wenn die Liste nicht lesbar ist.
+pub fn drivers() -> Option<Vec<String>> {
+    let (buf, count) =
+        two_pass(|p, cb, need, ret| unsafe { EnumPrinterDriversW(null(), null(), 1, p, cb, need, ret) })?;
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    let infos = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const DRIVER_INFO_1W, count as usize) };
+    Some(infos.iter().map(|i| unsafe { from_wide_ptr(i.pName) }).collect())
 }
 
 /// Alle installierten Drucker (lokal und Netzwerk), alphabetisch, optional ohne einen bestimmten.

@@ -77,6 +77,20 @@ jobs:
             Get-Content "$tmp\out.txt", "$tmp\err.txt" -ErrorAction SilentlyContinue | ForEach-Object { "  | $_" }
             if ($p.ExitCode -ne 0) { throw "PDF-Ablage $($a -join ' ') -> Exit $($p.ExitCode)" }
           }
+          function Expect-Exit([int]$code, [string[]]$a) {
+            $p = Start-Process $exe -ArgumentList $a -Wait -PassThru -NoNewWindow `
+                 -RedirectStandardOutput "$tmp\out.txt" -RedirectStandardError "$tmp\err.txt"
+            Get-Content "$tmp\out.txt", "$tmp\err.txt" -ErrorAction SilentlyContinue | ForEach-Object { "  | $_" }
+            if ($p.ExitCode -ne $code) { throw "PDF-Ablage $($a -join ' ') -> Exit $($p.ExitCode) (erwartet: $code)" }
+          }
+          function Check-Repair([string]$fall) {
+            Expect-Exit 1 @('pruefen')
+            Run-App @('reparieren')
+            Run-App @('pruefen')
+            $falsch = @(Our-Printers | Where-Object { $_.PortName -ne '\\.\pipe\PDFAblage' -or $_.DriverName -notlike '*Print*PDF*' })
+            if ($falsch.Count -gt 0 -or (Our-Printers).Count -ne 2) { Our-Printers | Format-Table Name, PortName, DriverName; throw "Reparatur ($fall) unvollständig" }
+            "Selbstreparatur ($fall): ok"
+          }
           function Files($dir) { @(Get-ChildItem $dir -Filter '*.pdf' -ErrorAction SilentlyContinue) }
           function Wait-Files($dir, [int]$count, [int]$seconds) {
             for ($i = 0; $i -lt $seconds -and (Files $dir).Count -lt $count; $i++) { Start-Sleep 1 }
@@ -199,6 +213,46 @@ jobs:
           if (Get-Printer -Name 'PDF-Ablage Rechnungen' -ErrorAction SilentlyContinue) { throw 'Drucker 2 wurde nicht entfernt' }
           Our-Printers | Format-Table Name, PortName
 
+          "== Selbstreparatur (Szenarien wie nach einem Windows-Update) =="
+          Run-App @('pruefen')
+          "-- Anschluss auf Speichern-Dialog umgestellt --"
+          Set-Printer -Name 'PDF-Ablage' -PortName 'PORTPROMPT:'
+          Check-Repair 'Anschluss verbogen'
+          "-- Drucker gelöscht --"
+          Remove-Printer -Name 'PDF-Ablage Quittungen'
+          Check-Repair 'Drucker gelöscht'
+          "-- Anderer Treiber --"
+          $fremd = (Get-PrinterDriver | Where-Object { $_.Name -notlike '*Print*PDF*' } | Select-Object -First 1).Name
+          if (-not $fremd) {
+            Add-PrinterDriver -Name 'Generic / Text Only' -ErrorAction SilentlyContinue
+            $fremd = (Get-PrinterDriver | Where-Object { $_.Name -notlike '*Print*PDF*' } | Select-Object -First 1).Name
+          }
+          $umgestellt = $false
+          if ($fremd) {
+            try { Set-Printer -Name 'PDF-Ablage' -DriverName $fremd; $umgestellt = $true }
+            catch { Write-Output "::warning title=Selbstreparatur::Treiber ließ sich für den Test nicht umstellen: $_" }
+          }
+          if ($umgestellt) {
+            Check-Repair "Treiber $fremd"
+          } elseif ($fremd) {
+          } else {
+            Write-Output "::warning title=Selbstreparatur::Kein zweiter Treiber verfügbar – Treiber-Szenario übersprungen"
+          }
+          "-- Alle Drucker und Anschluss entfernt --"
+          Our-Printers | ForEach-Object { Remove-Printer -Name $_.Name }
+          Restart-Service Spooler
+          Remove-PrinterPort -Name '\\.\pipe\PDFAblage'
+          if (Get-PrinterPort -Name '\\.\pipe\PDFAblage' -ErrorAction SilentlyContinue) { throw 'Anschluss ließ sich für den Test nicht entfernen' }
+          Check-Repair 'Anschluss entfernt'
+          "-- Nach der Reparatur wird wieder ohne Dialog gespeichert --"
+          Stop-Process $w -Force -ErrorAction SilentlyContinue
+          $w = Start-Process $exe -ArgumentList 'run' -PassThru -NoNewWindow
+          Start-Sleep 2
+          Print-All @('Repariert1') 'PDF-Ablage'
+          $f1 = Wait-Files $ziel1 6 60
+          if (@($f1 | Where-Object Name -like '*_Repariert1.pdf').Count -ne 1) { throw 'Druck nach der Reparatur nicht angekommen' }
+          Write-Output "::notice title=Selbstreparatur::Verbogener Anschluss, gelöschter Drucker, fremder Treiber und fehlender Anschluss wurden erkannt und repariert"
+
           "== Drucken, während die App nicht läuft =="
           Stop-Process $w -Force -ErrorAction SilentlyContinue
           Start-Sleep 1
@@ -206,7 +260,7 @@ jobs:
           Run-App @('print', "$tmp\Offlinetest.pdf", 'PDF-Ablage')
           Start-Sleep 3
           $w = Start-Process $exe -ArgumentList 'run' -PassThru -NoNewWindow
-          $f1 = Wait-Files $ziel1 6 90
+          $f1 = Wait-Files $ziel1 7 90
           if (@($f1 | Where-Object Name -like '*Offlinetest*').Count -ne 1) { throw 'Auftrag ohne laufende App ging verloren' }
           Write-Output "::notice title=Ohne laufende App::Auftrag wartete in der Warteschlange und kam nach dem Start an"
           Stop-Process $w -Force -ErrorAction SilentlyContinue

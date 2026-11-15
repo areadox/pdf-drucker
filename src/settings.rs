@@ -4,7 +4,7 @@
 
 use crate::config::{self, Config, PrinterConfig, APP_NAME, MAX_DIRS, MAX_PRINTERS};
 use crate::util::wide;
-use crate::{install, spooler, ui};
+use crate::{install, logic, spooler, ui};
 use std::cell::RefCell;
 use std::ptr::{null, null_mut};
 use std::sync::{Arc, Mutex, Once};
@@ -257,6 +257,9 @@ fn validate(working: &[PrinterConfig], saved: &Config) -> Result<(), String> {
         if p.all_dirs().is_empty() {
             return Err(format!("Bitte für „{}“ mindestens einen Speicherort angeben.", p.name));
         }
+        if let Some(msg) = logic::pattern_problem(&p.filename_pattern) {
+            return Err(format!("„{}“: {msg}", p.name));
+        }
         // Name darf nicht zu einem fremden Drucker gehören
         if let Some(port) = spooler::port_name(&p.name) {
             if !config::is_our_port(&port) && !saved.is_own_printer(&p.name) {
@@ -306,10 +309,11 @@ fn save() {
     let status = if !needs_sync {
         "Gespeichert."
     } else if ui::run_elevated("sync") {
+        install::note_sync_started();
         "Gespeichert. Die Drucker werden jetzt in Windows eingerichtet …"
     } else {
         "Gespeichert, aber noch nicht in Windows übernommen (Administratorrechte nötig). \
-         Nachholen über „Drucker in Windows einrichten …“ im Tray-Menü."
+         Nachholen über „Drucker prüfen / reparieren …“ im Tray-Menü."
     };
     set_text(hwnd, IDC_STATUS, status);
     with(|st| st.refresh());
@@ -540,7 +544,7 @@ pub fn open(cfg: Arc<Mutex<Config>>, on_saved: Option<Hook>, standalone: bool) {
         ctl("BUTTON", "Hinzufügen …", WS_TABSTOP, 0, (x + 344, 86, 84, 28), IDC_DIR_ADD);
         ctl("BUTTON", "Ändern …", WS_TABSTOP, 0, (x + 344, 121, 84, 28), IDC_DIR_EDIT);
         ctl("BUTTON", "Entfernen", WS_TABSTOP, 0, (x + 344, 156, 84, 28), IDC_DIR_REMOVE);
-        ctl("STATIC", "Dateiname (Platzhalter: {datum} {zeit} {titel}):", 0, 0, (x, 196, 428, 18), IDC_LABEL);
+        ctl("STATIC", "Dateiname (Platzhalter: {titel} {datum} {uhrzeit} {programm}):", 0, 0, (x, 196, 428, 18), IDC_LABEL);
         ctl("EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, (x, 216, 428, 24), IDC_PATTERN);
         ctl("BUTTON", "PDF nach dem Speichern öffnen (aus dem Hauptordner)", WS_TABSTOP | BS_AUTOCHECKBOX, 0, (x, 252, 428, 22), IDC_OPEN);
         ctl("BUTTON", "PDF zusätzlich ausdrucken auf:", WS_TABSTOP | BS_AUTOCHECKBOX, 0, (x, 280, 428, 22), IDC_PRINT);

@@ -36,8 +36,14 @@ pub enum Event {
 
 pub type Events = Arc<dyn Fn(Event) + Send + Sync>;
 
-/// Ein empfangener Druckauftrag: Drucker-Nr., Daten, Dokumentname.
-type Job = (u8, Vec<u8>, Option<String>);
+/// Ein empfangener Druckauftrag.
+struct Job {
+    printer: u8,
+    data: Vec<u8>,
+    document: Option<String>,
+    /// Programm, das gedruckt hat (soweit erkennbar)
+    program: Option<String>,
+}
 
 /// Nimmt Druckaufträge für alle eingestellten Drucker entgegen.
 pub struct Receiver {
@@ -61,10 +67,10 @@ impl Receiver {
             // Aufträge werden der Reihe nach abgelegt
             let (cfg, events) = (cfg.clone(), events.clone());
             thread::spawn(move || {
-                for (id, data, doc) in job_rx {
+                for job in job_rx {
                     let c = lock(&cfg);
-                    let p = c.printer(id).cloned().unwrap_or_else(|| c.first());
-                    if let Err(e) = save_job(&c, &p, &data, doc.as_deref(), &events, &print_tx) {
+                    let p = c.printer(job.printer).cloned().unwrap_or_else(|| c.first());
+                    if let Err(e) = save_job(&c, &p, &job, &events, &print_tx) {
                         log_error!("Druckauftrag für „{}“ konnte nicht gespeichert werden: {e:#}", p.name);
                     }
                 }
@@ -148,6 +154,12 @@ impl Receiver {
         let id = found.as_ref().map(|(id, _)| *id).unwrap_or_else(|| c.first().id);
         let printer = c.printer(id).map(|p| p.name.clone());
         let job = found.map(|(_, j)| j);
+        // Das druckende Programm: steht es nicht im Dokumentnamen ("Microsoft Word - …"),
+        // ist es so gut wie immer das Fenster im Vordergrund – gerade wurde dort „Drucken“ geklickt
+        let program = job
+            .as_ref()
+            .and_then(|j| logic::program_from_document(&j.document))
+            .or_else(|| ui::foreground_exe().and_then(|exe| logic::program_from_exe(&exe)));
         let data = read_all(h);
         unsafe {
             DisconnectNamedPipe(h);
@@ -195,7 +207,7 @@ impl Receiver {
             }
             return;
         }
-        let _ = self.job_tx.send((id, data, job.map(|j| j.document)));
+        let _ = self.job_tx.send(Job { printer: id, data, document: job.map(|j| j.document), program });
     }
 }
 
@@ -224,11 +236,11 @@ fn read_all(h: HANDLE) -> Result<Vec<u8>> {
 fn save_job(
     c: &Config,
     p: &PrinterConfig,
-    data: &[u8],
-    doc: Option<&str>,
+    job: &Job,
     events: &Events,
     print_tx: &Sender<(PathBuf, String)>,
 ) -> Result<()> {
+    let (data, doc) = (&job.data, job.document.as_deref());
     if data.is_empty() {
         log_warn!("Leerer Druckauftrag ignoriert ({}).", doc.unwrap_or("ohne Namen"));
         return Ok(());
@@ -242,13 +254,14 @@ fn save_job(
         .unwrap_or_else(|| "Druck".into());
 
     let now = chrono::Local::now();
-    let stem = logic::render_pattern(
-        &p.filename_pattern,
-        &now.format("%Y-%m-%d").to_string(),
-        &now.format("%H-%M-%S").to_string(),
-        &titel,
-    );
-    let stem = logic::safe_name(&stem, 150);
+    let parts = logic::NameParts {
+        titel,
+        datum: now.format("%Y-%m-%d").to_string(),
+        uhrzeit: now.format("%H-%M-%S").to_string(),
+        programm: job.program.clone().unwrap_or_default(),
+    };
+    let stem = logic::render_pattern(&p.filename_pattern, &parts);
+    let stem = logic::safe_name(&stem, logic::max_stem_len(&p.all_dirs()));
 
     // In jedem Speicherort ablegen; ein nicht erreichbarer Ordner verhindert die anderen nicht
     let mut saved: Vec<PathBuf> = Vec::new();
@@ -283,18 +296,16 @@ fn save_job(
     Ok(())
 }
 
-/// Legt die PDF in `dir` ab (eindeutiger Name, erst als .part, dann umbenannt).
+/// Legt die PDF in `dir` ab: erst unter Zwischennamen schreiben (damit z. B. Nextcloud keine
+/// halbe Datei synchronisiert), dann unter einem freien Namen ablegen – nie überschreiben.
 fn save_to(dir: &Path, stem: &str, data: &[u8]) -> Result<PathBuf> {
     std::fs::create_dir_all(dir).with_context(|| format!("Ordner {} nicht erreichbar oder nicht anlegbar", dir.display()))?;
-    let dst = logic::unique_path(dir, stem);
-    // Erst unter Zwischennamen schreiben, damit z. B. Nextcloud keine halbe Datei synchronisiert
-    let part = dst.with_extension("pdf.part");
+    let part = dir.join(format!("{stem}.{}.part", std::process::id()));
     std::fs::write(&part, data).with_context(|| format!("{} nicht schreibbar", part.display()))?;
-    if let Err(e) = std::fs::rename(&part, &dst) {
+    logic::place_file(&part, dir, stem).map_err(|e| {
         let _ = std::fs::remove_file(&part);
-        return Err(e).with_context(|| format!("{} nicht anlegbar", dst.display()));
-    }
-    Ok(dst)
+        anyhow::Error::new(e).context(format!("PDF in {} nicht anlegbar", dir.display()))
+    })
 }
 
 /// Zieldrucker für den zusätzlichen Ausdruck; nie ein PDF-Ablage-Drucker (Endlosschleife).
